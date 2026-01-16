@@ -1,3 +1,16 @@
 .venv
 __pycache__
 data/
+
+# データ系
+*.wav
+*.mid
+*.pt
+*.wav.gz
+*.mid.gz
+*.pt.gz
+*.wav.bz2
+*.mid.bz2
+*.pt.bz2
+
+GeneralUser-GS/

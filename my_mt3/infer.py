@@ -13,7 +13,7 @@ def greedy_decode(model, mel, device="cuda"):
             logits = model.dec(y, mem)[:,-1,:]  # [B,V]
             nxt = logits.argmax(-1)            # [B]
             tok = nxt.item()
-            out.append(tok); 
+            out.append(tok)
             if tok == VOCAB.eos: break
             y = torch.cat([y, nxt.unsqueeze(0)], dim=1)
     return out

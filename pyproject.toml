@@ -7,6 +7,8 @@ requires-python = ">=3.13"
 dependencies = [
     "midi2audio>=0.1.1",
     "numpy>=2.3.2",
+    "onnx>=1.20.1",
+    "onnxruntime>=1.23.2",
     "pretty-midi>=0.2.10",
     "soundfile>=0.13.1",
     "torch>=2.8.0",

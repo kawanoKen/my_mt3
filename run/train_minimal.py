@@ -25,7 +25,7 @@ if __name__ == "__main__":
     model = train_loop(
         pairs,
         epochs=10,          # まず10周（必要に応じて20〜30）
-        bs=16,              # VRAMに応じて 8〜32
+        bs=4,              # VRAMに応じて 8〜32
         lr=2e-4,
         device="cuda" if torch.cuda.is_available() else "cpu"
     )

@@ -51,7 +51,10 @@ def main():
         help=f"使用するSoundFont(.sf2)のパス（既定: {default_sf2}）"
     )
     parser.add_argument("--out", help="出力WAVファイルのパス（--midi指定時のみ）")
-    parser.add_argument("--out_dir", help="出力先ディレクトリ（--midi_dir指定時）")
+    parser.add_argument(
+        "--out_dir",
+        help="出力先ディレクトリ（--midi_dir指定時、未指定なら <midi_dir>_wavs を自動作成）"
+    )
     parser.add_argument("--recursive", action="store_true", help="サブディレクトリも再帰的に処理")
     parser.add_argument("--overwrite", action="store_true", help="既存のWAVがあっても上書きする")
     args = parser.parse_args()
@@ -77,9 +80,12 @@ def main():
     if not dir_path.is_dir():
         raise SystemExit(f"ディレクトリが見つかりません: {dir_path}")
 
-    out_base = Path(args.out_dir) if args.out_dir else None
-    if out_base:
-        out_base.mkdir(parents=True, exist_ok=True)
+    if args.out_dir:
+        out_base = Path(args.out_dir)
+    else:
+        out_base = dir_path.with_name(dir_path.name + "_wavs")
+        print(f"出力先が未指定のため自動作成します: {out_base}")
+    out_base.mkdir(parents=True, exist_ok=True)
 
     fs = FluidSynth(args.sf2)
     converted = 0

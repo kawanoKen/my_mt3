@@ -14,3 +14,6 @@ data/
 *.pt.bz2
 
 GeneralUser-GS/
+
+cache/
+dataset/

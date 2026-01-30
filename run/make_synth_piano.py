@@ -5,7 +5,7 @@ import pretty_midi
 import torch
 import torchaudio
 
-SR = 22050
+SR = 16000
 CHUNK_SEC = 2.048
 N_SAMPLES = 50
 OUT_WAV = "data/wavs"

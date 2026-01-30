@@ -14,7 +14,7 @@ class PosEmb(nn.Module):
         return x + self.pe[:x.size(1)]
 
 class Encoder(nn.Module):
-    def __init__(self, n_mels=256, d=384, L=6, nhead=6, ff=1536):
+    def __init__(self, n_mels=256, d=384, L=8, nhead=6, ff=1024):
         super().__init__()
         self.proj = nn.Linear(n_mels, d)
         self.pos = PosEmb(d)
@@ -25,7 +25,7 @@ class Encoder(nn.Module):
         return h  # [B,T,D]
 
 class Decoder(nn.Module):
-    def __init__(self, vocab_size, d=384, L=6, nhead=6, ff=1536):
+    def __init__(self, vocab_size, d=384, L=8, nhead=6, ff=1024):
         super().__init__()
         self.emb = nn.Embedding(vocab_size, d)
         self.pos = PosEmb(d)

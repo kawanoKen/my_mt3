@@ -1,74 +1,113 @@
-# amtx/audio.py  (torchaudio版)
+# my_mt3/audio_io.py
+from __future__ import annotations
+
+from pathlib import Path
+import os
+import hashlib
 import numpy as np
-import torch
 import torchaudio
+import torch
+from dataclasses import dataclass
 
-# ===== 基本パラメータ（MVP既定） =====
-DEFAULT_SR = 22050
+DEFAULT_SR = 16000
 
-def load_wav_mono(path: str, sr: int = DEFAULT_SR) -> tuple[np.ndarray, int]:
-    """
-    WAV読み込み -> mono化 -> 目的サンプルレートへリサンプル。
-    返り値は (waveform(float32, shape[T]), sr)
-    """
-    wav, file_sr = torchaudio.load(path)          # wav: [C, T], float32/float64
-    if wav.dim() == 2 and wav.size(0) > 1:        # stereo -> mono (平均)
+
+def load_wav_mono_resample(path: str, sr: int = DEFAULT_SR) -> np.ndarray:
+    """wav -> mono -> resample(sr) -> np.float32 [T]"""
+    wav, file_sr = torchaudio.load(path)  # [C, T]
+    if wav.dim() == 2 and wav.size(0) > 1:
         wav = wav.mean(dim=0, keepdim=True)
-    elif wav.dim() == 1:                          # [T] -> [1, T]
+    elif wav.dim() == 1:
         wav = wav.unsqueeze(0)
 
     if file_sr != sr:
-        resampler = torchaudio.transforms.Resample(orig_freq=file_sr, new_freq=sr)
-        wav = resampler(wav)
+        wav = torchaudio.transforms.Resample(orig_freq=file_sr, new_freq=sr)(wav)
 
-    wav = wav.squeeze(0).contiguous()             # [T]
-    return wav.numpy().astype(np.float32), sr
+    return wav.squeeze(0).contiguous().cpu().numpy().astype(np.float32)
 
-def wav_to_logmel(
-    y: np.ndarray,
+
+def load_audio_mono(path: str, sr: int = DEFAULT_SR) -> tuple[np.ndarray, int]:
+    """
+    - .npy: 波形キャッシュ（[T] float32）を memmapで読む
+    - それ以外: wav を mono+resample
+    """
+    p = Path(path)
+    if p.suffix.lower() == ".npy":
+        y = np.load(str(p), mmap_mode="r")
+        return np.asarray(y, dtype=np.float32), sr
+    return load_wav_mono_resample(str(p), sr=sr), sr
+
+
+def _cache_key(wav_path: str) -> str:
+    # 同名衝突回避：パスをhash化して短いキーに
+    s = str(wav_path).replace("\\", "/")
+    h = hashlib.sha1(s.encode("utf-8")).hexdigest()[:16]
+    stem = Path(s).stem
+    return f"{stem}.{h}"
+
+
+def ensure_wave_cache(
+    wav_path: str,
+    *,
+    cache_dir: str,
     sr: int = DEFAULT_SR,
-    n_fft: int = 2048,
-    hop: int = 256,
-    n_mels: int = 256,
-    power: float = 2.0,
-) -> np.ndarray:
+) -> str:
+    cache_dir_p = Path(cache_dir)
+    cache_dir_p.mkdir(parents=True, exist_ok=True)
+
+    key = _cache_key(wav_path)
+    out_path = cache_dir_p / f"{key}.sr{sr}.npy"
+
+    if out_path.exists():
+        return str(out_path)
+
+    y = load_wav_mono_resample(wav_path, sr=sr)
+
+    # ★重要: tmp も ".npy" で終わらせる（np.save が勝手に拡張子を付けないように）
+    tmp_path = str(out_path) + ".tmp.npy"
+
+    np.save(tmp_path, y)
+    os.replace(tmp_path, out_path)  # 原子的に置換
+
+    return str(out_path)
+
+@dataclass
+class LogMelCfg:
+    sr: int = 16000
+    n_fft: int = 2048
+    hop: int = 256
+    n_mels: int = 256
+    power: float = 2.0
+    f_min: float = 0.0
+    f_max: float | None = None
+    mel_scale: str = "htk"
+
+class LogMelExtractor:
     """
-    波形(y) -> log-Melスペクトログラム。
-    返り値は [T, n_mels] の float32（librosa版と互換の転置）
+    center=False（左端アライン）log-mel
     """
-    # numpy -> torch [1, T]
-    wav = torch.from_numpy(y).float().unsqueeze(0)
+    def __init__(self, cfg: LogMelCfg):
+        self.cfg = cfg
+        f_max = cfg.f_max if cfg.f_max is not None else cfg.sr / 2.0
 
-    mel_spec = torchaudio.transforms.MelSpectrogram(
-        sample_rate=sr,
-        n_fft=n_fft,
-        hop_length=hop,
-        n_mels=n_mels,
-        power=power,          # librosaの power=2.0 と同義（パワースペクトログラム）
-        center=True,
-        pad_mode="reflect",
-        f_min=0.0,
-        f_max=sr / 2.0,
-        norm=None,            # librosaのデフォルトに近づけるなら None を維持
-        mel_scale="htk",      # librosaに合わせたいなら "htk"（好みで "slaney" でも可）
-    )
+        self.mel = torchaudio.transforms.MelSpectrogram(
+            sample_rate=cfg.sr,
+            n_fft=cfg.n_fft,
+            hop_length=cfg.hop,
+            n_mels=cfg.n_mels,
+            power=cfg.power,
+            center=False,        # ★重要
+            pad_mode="reflect",
+            f_min=cfg.f_min,
+            f_max=f_max,
+            norm=None,
+            mel_scale=cfg.mel_scale,
+        )
+        self.amp2db = torchaudio.transforms.AmplitudeToDB(stype="power", top_db=None)
 
-    amp2db = torchaudio.transforms.AmplitudeToDB(stype="power", top_db=None)
-    spec = mel_spec(wav)                # [1, n_mels, T_spec]
-    logmel = amp2db(spec).squeeze(0)    # [n_mels, T_spec]
+    def __call__(self, y: np.ndarray) -> np.ndarray:
+        wav = torch.from_numpy(y).float().unsqueeze(0)  # [1, T]
+        spec = self.mel(wav)                            # [1, n_mels, T']
+        logmel = self.amp2db(spec).squeeze(0)           # [n_mels, T']
+        return logmel.transpose(0, 1).contiguous().numpy().astype(np.float32)  # [T', n_mels]
 
-    # 転置して [T, n_mels] に揃える
-    return logmel.transpose(0, 1).contiguous().numpy().astype(np.float32)
-
-def chunk_indices(total_sec, chunk_sec=2.048, include_last=True):
-    t, out, eps = 0.0, [], 5e-3
-    while t + chunk_sec <= total_sec + eps:
-        out.append((t, min(t + chunk_sec, total_sec)))
-        t += chunk_sec
-    if include_last and not out and total_sec > 0:
-        out.append((0.0, min(chunk_sec, total_sec)))
-    return out
-
-def ms_quantize(timesec: float, step_ms: int = 10) -> int:
-    """秒をms刻みの整数インデックスに量子化"""
-    return int(round(timesec * 1000 / step_ms))

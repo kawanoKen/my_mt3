@@ -26,7 +26,7 @@ import pretty_midi
 from tqdm import tqdm
 
 from my_mt3.model import MT3Mini
-from my_mt3.tokenizer import VOCAB
+from my_mt3.tokenizer import VOCAB, INPUT_FRAMES
 from my_mt3.dataset import chunk_indices, LogMelCfg, LogMelExtractor   # ← dataset.py にある前提
 from my_mt3.audio import load_audio_mono, ensure_wave_cache, DEFAULT_SR
 from my_mt3.infer import greedy_decode, to_midi_from_tokens            # ← 既存関数の想定
@@ -122,6 +122,7 @@ def infer_one_song(
             mel_t,
             max_len=max_len,
             device=device,
+            program_id=int(pid)
         )
 
         # --- tokens -> MIDI (chunk内) ---
@@ -142,7 +143,6 @@ def main():
     ap.add_argument("--out_dir", type=str, default="outputs/groove_test_pred")
     ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--sr", type=int, default=16000)
-    ap.add_argument("--chunk_sec", type=float, default=2.048)
     ap.add_argument("--n_fft", type=int, default=2048)
     ap.add_argument("--hop", type=int, default=256)
     ap.add_argument("--n_mels", type=int, default=256)
@@ -154,6 +154,7 @@ def main():
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    chunk_sec = INPUT_FRAMES * args.hop / args.sr
 
     # --- collect test pairs ---
     pairs = collect_pairs_groove(args.root, split=args.split, program_id=args.program_id)
@@ -164,6 +165,8 @@ def main():
     # --- model ---
     model = MT3Mini(vocab_size=len(VOCAB.itos)).to(args.device)
     sd = torch.load(args.ckpt, map_location="cpu")
+    if any(k.startswith("module.") for k in sd.keys()):
+        sd = {k[len("module."):]: v for k, v in sd.items()}
     model.load_state_dict(sd, strict=True)
     model.eval()
 
@@ -183,7 +186,7 @@ def main():
             a_path,
             device=args.device,
             sr=args.sr,
-            chunk_sec=args.chunk_sec,
+            chunk_sec=chunk_sec,
             mel_cfg=mel_cfg,
             max_len=args.max_len,
             pid=pid,

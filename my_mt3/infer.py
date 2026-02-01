@@ -9,7 +9,7 @@ from .tokenizer import VOCAB
 
 
 @torch.no_grad()
-def greedy_decode(model, mel, *, max_len: int = 1024, device: str = "cuda"):
+def greedy_decode(model, mel, *, max_len: int = 1024, device: str = "cuda", program_id=0):
     """
     Args:
       model: MT3Mini
@@ -43,6 +43,9 @@ def greedy_decode(model, mel, *, max_len: int = 1024, device: str = "cuda"):
         bos_id = int(getattr(VOCAB, "bos", None) or getattr(VOCAB, "eos"))
 
     eos_id = int(VOCAB.eos)
+    prg_key = f"PRG_{int(program_id)}"
+    bos_id = VOCAB.program.get(prg_key, int(min(VOCAB.program.values())))
+    y = torch.full((1, 1), int(bos_id), dtype=torch.long, device=device)
 
     # y: [1,1]
     y = torch.full((1, 1), bos_id, dtype=torch.long, device=device)

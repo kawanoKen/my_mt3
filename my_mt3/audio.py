@@ -106,7 +106,7 @@ class LogMelExtractor:
         self.amp2db = torchaudio.transforms.AmplitudeToDB(stype="power", top_db=None)
 
     def __call__(self, y: np.ndarray) -> np.ndarray:
-        wav = torch.from_numpy(y).float().unsqueeze(0)  # [1, T]
+        wav = torch.from_numpy(y.copy()).float().unsqueeze(0)  # [1, T]
         spec = self.mel(wav)                            # [1, n_mels, T']
         logmel = self.amp2db(spec).squeeze(0)           # [n_mels, T']
         return logmel.transpose(0, 1).contiguous().numpy().astype(np.float32)  # [T', n_mels]

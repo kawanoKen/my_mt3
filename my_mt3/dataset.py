@@ -11,7 +11,7 @@ import torchaudio
 import pretty_midi
 from torch.utils.data import Dataset
 from my_mt3.audio import load_audio_mono, LogMelExtractor, LogMelCfg
-from my_mt3.tokenizer import encode_events
+from my_mt3.tokenizer import encode_events, INPUT_FRAMES
 import random
 
 DEFAULT_SR = 16000
@@ -38,44 +38,59 @@ def ms_quantize(timesec: float, step_ms: int = 10) -> int:
     """秒をms刻みの整数インデックスに量子化"""
     return int(round(timesec * 1000 / step_ms))
 
+
+
 class AMTDataset(Dataset):
     """
     pairs: [(wav_or_cache_path, midi_path, program_id), ...]
 
-    __getitem__ は 1曲について複数チャンクを列挙して返す:
-      chunks = [(mel, token_ids, (s_sec, e_sec)), ...]
+    1 item (1曲) -> chunks = [(mel[input_frames,n_mels], token_ids, (s_sec,e_sec)), ...]
+    train: ランダムに max_chunks_per_song 個の窓をサンプル
+    val/test: 全曲を決定論的に走査
     """
+
     def __init__(
         self,
         pairs: List[Tuple[str, str, int]],
         *,
         mode: str = "train",
-        sr: int = DEFAULT_SR,
+        sr: int = 16000,
         hop: int = 256,
         step_ms: int = 10,
-        chunk_sec: float = 2.048,
-        max_chunks_per_song=8,
+        input_frames: int = INPUT_FRAMES,
+        max_chunks_per_song: int | None = 8,
+        stride_frames: int | None = None,   # val/test のスライド間隔（Noneなら input_frames）
         include_last: bool = True,
         n_fft: int = 2048,
         n_mels: int = 256,
     ):
         self.pairs = pairs
+        self.mode = mode
         self.sr = sr
         self.hop = hop
         self.step_ms = step_ms
-        self.chunk_sec = chunk_sec
-        self.include_last = include_last
-        self.mode = mode
+        self.input_frames = int(input_frames)
         self.max_chunks_per_song = max_chunks_per_song
+        self.include_last = include_last
+
+        # val/test の stride: デフォは window と同じ（non-overlap）
+        self.stride_frames = int(stride_frames) if stride_frames is not None else int(input_frames)
 
         self.feat = LogMelExtractor(LogMelCfg(sr=sr, n_fft=n_fft, hop=hop, n_mels=n_mels))
 
-        # MIDIパースを高速化したい場合の簡易キャッシュ（プロセス内のみ）
-        self._midi_cache: dict[str, list[tuple[float, float, int]]] = {}
+        # center=False の STFT で input_frames の mel を得るのに必要な波形サンプル数
+        self.need_samples = (self.input_frames - 1) * self.hop + n_fft
 
-        # token側の最大フレーム（Timeトークンの定義に合わせて 0..204 などに固定したいならここ）
-        frame_max_template = int(round(chunk_sec * 1000 / step_ms))  # 2.048s & 10ms => ~205
-        self.frame_max_token = max(0, frame_max_template - 1)         # 204
+        # このウィンドウの秒数（token側 frame_max を決めるために使う）
+        self.window_sec = self.need_samples / float(self.sr)
+
+        # 10ms刻みトークンの最大 index（0..frame_max_token）
+        # 例: window_sec=8.2s, step_ms=10ms -> 820 -> frame_max=819
+        frame_max_template = int(round(self.window_sec * 1000.0 / self.step_ms))
+        self.frame_max_token = max(0, frame_max_template - 1)
+
+        # MIDIパース簡易キャッシュ（worker内）
+        self._midi_cache: dict[str, list[tuple[float, float, int]]] = {}
 
     def __len__(self) -> int:
         return len(self.pairs)
@@ -88,62 +103,89 @@ class AMTDataset(Dataset):
         self._midi_cache[midi_path] = notes
         return notes
 
+    def _make_start_samples(self, total_samples: int):
+        """
+        window（need_samples）を切り出す開始サンプルssを列挙。
+        """
+        max_start = max(0, total_samples - self.need_samples)
+
+        if self.mode == "train":
+            # ランダムにK個（曲が短い場合もss=0でOK）
+            if self.max_chunks_per_song is None:
+                # None のときは全列挙に近くなるので注意（非推奨）
+                return list(range(0, max_start + 1, self.need_samples))
+
+            K = int(self.max_chunks_per_song)
+            if max_start == 0:
+                starts = [0] * K
+            else:
+                starts = [random.randint(0, max_start) for _ in range(K)]
+            starts = sorted(starts)  # 任意：時系列順
+            return starts
+
+        # val/test: 決定論的に全曲をスライド
+        stride_samples = self.stride_frames * self.hop
+        starts = list(range(0, max_start + 1, stride_samples))
+
+        # include_last=Trueなら末尾を必ずカバー（端が余る場合に最後を追加）
+        if self.include_last and len(starts) > 0:
+            last = starts[-1]
+            if last != max_start and (max_start - last) > 0:
+                starts.append(max_start)
+        elif self.include_last and len(starts) == 0:
+            starts = [0]
+
+        return starts
+
     def __getitem__(self, i: int):
         wav_path, midi_path, pid = self.pairs[i]
 
-        # ---- load wave (wav or cache) ----
+        # ---- audio ----
         y, _ = load_audio_mono(wav_path, sr=self.sr)
-        total_sec = float(len(y)) / float(self.sr)
+        total_samples = int(len(y))
 
-        # ---- load MIDI notes ----
+        # ---- midi notes ----
         notes = self._load_notes(midi_path)
 
-        chunks = []
-        if self.mode == "train":
-            chunk_list = chunk_indices(total_sec, self.chunk_sec, include_last=True)
-            if self.max_chunks_per_song is not None:
-                if len(chunk_list) > self.max_chunks_per_song:
-                    chunk_list = random.sample(chunk_list, self.max_chunks_per_song)
-                    # 時系列順が良ければソート（任意）
-                    chunk_list = sorted(chunk_list, key=lambda x: x[0])
-        else:
-            # 完全決定論的：0秒から最後まで
-            chunk_list = chunk_indices(
-                total_sec,
-                self.chunk_sec,
-                include_last=True
-            )
+        # ---- window starts ----
+        start_samples = self._make_start_samples(total_samples)
 
-        for s_sec, e_sec in chunk_list:
-            ss = int(round(s_sec * self.sr))
-            ee = int(round(e_sec * self.sr))
-            if ee <= ss:
-                continue
+        chunks = []
+        for ss in start_samples:
+            ee = ss + self.need_samples
             y_seg = y[ss:ee]
 
-            # center=False なので、最低 n_fft サンプルないとフレームが0になる
-            # 短い末尾チャンクを捨てたくないなら pad する（ここでは pad して1フレーム以上確保）
-            n_fft = self.feat.cfg.n_fft
-            if len(y_seg) < n_fft:
-                pad = n_fft - len(y_seg)
-                y_seg = np.pad(y_seg, (0, pad), mode="constant")
+            # 末尾不足はpadして固定長に
+            if len(y_seg) < self.need_samples:
+                y_seg = np.pad(y_seg, (0, self.need_samples - len(y_seg)), mode="constant")
 
-            mel = self.feat(y_seg)  # [T_chunk_mel, n_mels]
+            # mel: 必ず [input_frames, n_mels]（center=False + need_samples固定）
+            mel = self.feat(y_seg)
 
-            # ---- MIDI -> events (0..204に収める) ----
+            # 念のため長さ保証（理論上一致する）
+            if mel.shape[0] != self.input_frames:
+                # 万一ズレたら切る/パディング（保険）
+                if mel.shape[0] > self.input_frames:
+                    mel = mel[: self.input_frames]
+                else:
+                    padT = self.input_frames - mel.shape[0]
+                    mel = np.pad(mel, ((0, padT), (0, 0)), mode="constant")
+
+            s_sec = ss / float(self.sr)
+            e_sec = (ss + self.need_samples) / float(self.sr)
+
+            # ---- MIDI -> events ----
             ev = []
             ties = []
-            frame_max = self.frame_max_token  # 204
+            frame_max = self.frame_max_token
 
             for on, off, p in notes:
                 if off <= s_sec or on >= e_sec:
                     continue
 
-                # チャンク基準に変換して10ms刻みへ
                 on_q  = max(0, min(ms_quantize(on  - s_sec, self.step_ms), frame_max))
                 off_q = max(0, min(ms_quantize(off - s_sec, self.step_ms), frame_max))
 
-                # 前チャンクから継続しているノート（tie）
                 if on < s_sec:
                     tie_off = ms_quantize(min(off, e_sec) - s_sec, self.step_ms)
                     tie_off = max(0, min(tie_off, frame_max))
@@ -152,9 +194,7 @@ class AMTDataset(Dataset):
 
                 ev.append((on_q, off_q, p))
 
-            # ここはあなたの既存実装を使う前提
-            token_ids = encode_events(ev, pid, ties)
-
+            token_ids = encode_events(ev, pid, ties, frame_max_token=self.frame_max_token)
             chunks.append((mel, token_ids, (s_sec, e_sec)))
 
         return chunks

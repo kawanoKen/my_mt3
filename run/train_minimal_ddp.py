@@ -11,7 +11,7 @@ import torch
 from pathlib import Path
 import pandas as pd
 from typing import Dict, List, Tuple, Optional
-from my_mt3.train import train_loop
+from my_mt3.train import train_loop_distributed
 import warnings
 from datetime import datetime
 
@@ -73,17 +73,19 @@ if __name__ == "__main__":
     os.makedirs(save_dir, exist_ok=True)
     print(f"📁 Checkpoints will be saved to: {save_dir}")
 
-    model = train_loop(
+    model = train_loop_distributed(
         pairs,
-        epochs=1000,          # まず10周（必要に応じて20〜30）
+        epochs=2000,          # まず10周（必要に応じて20〜30）
         save_every=100,
         save_dir=save_dir,
-        bs=8,              # VRAMに応じて 8〜32
+        bs=16,              # VRAMに応じて 8〜32
         lr=2e-4,
-        device="cuda" if torch.cuda.is_available() else "cpu",
         # train_loop 側でキャッシュ作成する想定（train_minimalはシンプル）
         use_cache=True,
         cache_dir="cache/wave_sr16000",
         sr=16000,
     )
-    print("saved -> ckpt_piano.pt")
+    print("saved -> saved checkpoints to {save_dir}")
+
+
+# python -m torch.distributed.run --nproc_per_node=2 run/train_minimal_ddp.py

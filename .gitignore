@@ -13,6 +13,15 @@ data/
 *.mid.bz2
 *.pt.bz2
 
+*.pt
+*.wav
+*.midi
+*.mid
+ckpt/
+ckpt_vae/
+
+soundfont/
+
 GeneralUser-GS/
 
 cache/

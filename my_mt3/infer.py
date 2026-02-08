@@ -67,7 +67,14 @@ def greedy_decode(model, mel, *, max_len: int = 1024, device: str = "cuda", prog
     return out
 
 
-def to_midi_from_tokens(token_ids, *, program_id: int = 0, step_ms: int = 10, velocity: int = 80):
+def to_midi_from_tokens(
+    token_ids,
+    *,
+    program_id: int = 0,
+    step_ms: int = 10,
+    velocity: int = 80,
+    default_dur_ms: int = 50,
+):
     """
     Args:
       token_ids: List[int]
@@ -81,7 +88,9 @@ def to_midi_from_tokens(token_ids, *, program_id: int = 0, step_ms: int = 10, ve
     inst = pretty_midi.Instrument(program=int(program_id))
 
     cur_ms = 0
-    onsets = {}  # pitch -> onset_ms
+    # Note Off を使わない仕様のため、onsets は使わず On の時点で固定長のノートを生成
+    # --- 旧実装（Note Off あり）の参考 ---
+    # onsets = {}  # pitch -> onset_ms
 
     eos_id = int(VOCAB.eos)
 
@@ -99,21 +108,31 @@ def to_midi_from_tokens(token_ids, *, program_id: int = 0, step_ms: int = 10, ve
 
         elif tok.startswith("NON_"):
             p = int(tok.split("_")[1])
-            onsets[p] = cur_ms
-
-        elif tok.startswith("NOF_"):
-            p = int(tok.split("_")[1])
-            if p in onsets:
-                on_ms = onsets.pop(p)
-                if cur_ms > on_ms:  # 0長や逆転を防ぐ
-                    inst.notes.append(
-                        pretty_midi.Note(
-                            velocity=int(velocity),
-                            pitch=int(p),
-                            start=on_ms / 1000.0,
-                            end=cur_ms / 1000.0,
-                        )
-                    )
+            start_s = cur_ms / 1000.0
+            end_s = (cur_ms + int(default_dur_ms)) / 1000.0
+            # 0長を避けるため max を入れてもよいが、固定長 > 0 なので不要
+            inst.notes.append(
+                pretty_midi.Note(
+                    velocity=int(velocity),
+                    pitch=int(p),
+                    start=start_s,
+                    end=end_s,
+                )
+            )
+        # --- 旧実装（Note Off あり）の参考 ---
+        # elif tok.startswith("NOF_"):
+        #     p = int(tok.split("_")[1])
+        #     if p in onsets:
+        #         on_ms = onsets.pop(p)
+        #         if cur_ms > on_ms:  # 0長や逆転を防ぐ
+        #             inst.notes.append(
+        #                 pretty_midi.Note(
+        #                     velocity=int(velocity),
+        #                     pitch=int(p),
+        #                     start=on_ms / 1000.0,
+        #                     end=cur_ms / 1000.0,
+        #                 )
+        #             )
         else:
             # MVP: 未知トークンは無視
             continue

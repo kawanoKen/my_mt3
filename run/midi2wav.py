@@ -1,112 +1,124 @@
-from midi2audio import FluidSynth
-from pathlib import Path
 import argparse
+import subprocess
+import tempfile
 import os
+from pathlib import Path
 
-# https://drive.usercontent.google.com/download?id=1UJ1mrY2l_C_YbKeyywNUymBz7OTVzQLU&export=download&authuser=0
-# こちらでsfをダウンロード
+import mido
 
-def convert_midi_to_wav(midi_file, soundfont_file, output_wav):
-    """
-    MIDIファイルをWAVに変換する
-    
-    Args:
-        midi_file (str): 入力するMIDIファイルのパス
-        soundfont_file (str): 使用するSoundFont(.sf2)のパス
-        output_wav (str): 出力するWAVファイルのパス
-    """
-    # FluidSynthのインスタンスを作成（SoundFontを指定）
-    fs = FluidSynth(soundfont_file)
-    
-    # 変換実行
-    print(f"変換中: {midi_file} ...")
-    fs.midi_to_audio(midi_file, output_wav)
-    print(f"完了: {output_wav}")
 
-def midi_to_wav_with_fs(fs: FluidSynth, midi_path: Path, wav_path: Path) -> None:
-    print(f"変換中: {midi_path} ...")
-    fs.midi_to_audio(str(midi_path), str(wav_path))
-    print(f"完了: {wav_path}")
+DRUM_CH = 9  # MIDIのCh10 (0-indexed)
 
-def find_midi_files(root: Path, recursive: bool):
-    patterns = ["*.mid", "*.midi"]
-    if recursive:
-        for pat in patterns:
-            yield from root.rglob(pat)
+
+def rewrite_midi_all_drums(src_midi: Path, dst_midi: Path, program: int = 0) -> None:
+    import mido
+
+    DRUM_CH = 9
+    mid = mido.MidiFile(str(src_midi))
+    out = mido.MidiFile(ticks_per_beat=mid.ticks_per_beat)
+
+    for tr in mid.tracks:
+        new_tr = mido.MidiTrack()
+
+        # トラック先頭に program_change を置く（Bankは入れない）
+        new_tr.append(mido.Message("program_change", channel=DRUM_CH, program=program, time=0))
+
+        for msg in tr:
+            msg = msg.copy()
+
+            if msg.is_meta:
+                new_tr.append(msg)
+                continue
+
+            if hasattr(msg, "channel"):
+                msg.channel = DRUM_CH
+
+            # Bank Select (CC0/32) は削除（不要・干渉防止）
+            if msg.type == "control_change" and msg.control in (0, 32):
+                continue
+
+            # program_change も固定
+            if msg.type == "program_change":
+                msg.program = program
+
+            new_tr.append(msg)
+
+        out.tracks.append(new_tr)
+
+    out.save(str(dst_midi))
+
+
+def midi_to_wav(
+    midi_path: str | Path,
+    wav_path: str | Path,
+    soundfont: str | Path,
+    sr: int = 44100,
+    force_drums: bool = False,
+) -> None:
+    midi_path = Path(midi_path)
+    wav_path = Path(wav_path)
+    soundfont = Path(soundfont)
+    wav_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # force_drums のときは MIDI を書き換えた一時ファイルを使う
+    tmp_midi_path = None
+    if force_drums:
+        fd, p = tempfile.mkstemp(suffix=".mid")
+        os.close(fd)
+        tmp_midi_path = Path(p)
+        rewrite_midi_all_drums(midi_path, tmp_midi_path, program=0)
+        midi_for_render = tmp_midi_path
     else:
-        for pat in patterns:
-            yield from root.glob(pat)
+        midi_for_render = midi_path
+
+    try:
+        args = [
+            "fluidsynth",
+            "-ni",
+            str(soundfont),
+            str(midi_for_render),
+            "-F",
+            str(wav_path),
+            "-r",
+            str(sr),
+        ]
+        subprocess.run(args, check=True)
+    finally:
+        if tmp_midi_path and tmp_midi_path.exists():
+            tmp_midi_path.unlink(missing_ok=True)
+
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="MIDIをWAVへ変換（単一ファイル or ディレクトリ対応）"
-    )
-    default_sf2 = (Path(__file__).resolve().parents[1] / "GeneralUser-GS" / "GeneralUser-GS.sf2")
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--midi", help="変換するMIDIファイルのパス")
-    group.add_argument("--midi_dir", help="変換するMIDIファイルが入ったディレクトリ")
-    parser.add_argument(
-        "--sf2",
-        default=str(default_sf2),
-        help=f"使用するSoundFont(.sf2)のパス（既定: {default_sf2}）"
-    )
-    parser.add_argument("--out", help="出力WAVファイルのパス（--midi指定時のみ）")
-    parser.add_argument(
-        "--out_dir",
-        help="出力先ディレクトリ（--midi_dir指定時、未指定なら <midi_dir>_wavs を自動作成）"
-    )
-    parser.add_argument("--recursive", action="store_true", help="サブディレクトリも再帰的に処理")
-    parser.add_argument("--overwrite", action="store_true", help="既存のWAVがあっても上書きする")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser(description="MIDI -> WAV (fluidsynth)")
+    default_sf2 = Path(__file__).resolve().parents[1] / "soundfont" / "SGM-V2.01.sf2"
 
-    sf2_path = Path(args.sf2)
-    if not sf2_path.is_file():
-        raise SystemExit(
-            f"SoundFontが見つかりません: {sf2_path}\n"
-            f"--sf2 で有効な .sf2 を指定してください。"
-        )
+    g = ap.add_mutually_exclusive_group(required=True)
+    g.add_argument("--midi", help="入力MIDIファイル")
+    g.add_argument("--midi_dir", help="入力MIDIディレクトリ（再帰）")
+
+    ap.add_argument("--sf2", default=str(default_sf2), help="SoundFont(.sf2)")
+    ap.add_argument("--out", help="出力WAV（--midi時）")
+    ap.add_argument("--out_dir", help="出力ディレクトリ（--midi_dir時）")
+    ap.add_argument("--sr", type=int, default=44100, help="サンプリングレート")
+    ap.add_argument("--drums", action="store_true", help="どんなMIDIでも強制ドラム再生")
+
+    args = ap.parse_args()
 
     if args.midi:
-        midi_path = Path(args.midi)
-        if not midi_path.is_file():
-            raise SystemExit(f"ファイルが見つかりません: {midi_path}")
-        out_path = Path(args.out) if args.out else midi_path.with_suffix(".wav")
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        convert_midi_to_wav(str(midi_path), args.sf2, str(out_path))
+        midi = Path(args.midi)
+        out = Path(args.out) if args.out else midi.with_suffix(".wav")
+        midi_to_wav(midi, out, args.sf2, sr=args.sr, force_drums=args.drums)
         return
 
-    # ディレクトリ処理
-    dir_path = Path(args.midi_dir)
-    if not dir_path.is_dir():
-        raise SystemExit(f"ディレクトリが見つかりません: {dir_path}")
+    root = Path(args.midi_dir)
+    out_base = Path(args.out_dir) if args.out_dir else root.with_name(root.name + "_wavs")
 
-    if args.out_dir:
-        out_base = Path(args.out_dir)
-    else:
-        out_base = dir_path.with_name(dir_path.name + "_wavs")
-        print(f"出力先が未指定のため自動作成します: {out_base}")
-    out_base.mkdir(parents=True, exist_ok=True)
+    for ext in ["*.mid", "*.midi"]:
+        for midi in root.rglob(ext):
+            rel = midi.relative_to(root)
+            wav = out_base.joinpath(rel).with_suffix(".wav")
+            midi_to_wav(midi, wav, args.sf2, sr=args.sr, force_drums=args.drums)
 
-    fs = FluidSynth(args.sf2)
-    converted = 0
-    for midi_file in find_midi_files(dir_path, args.recursive):
-        rel = midi_file.relative_to(dir_path)
-        wav_path = (
-            out_base.joinpath(rel).with_suffix(".wav")
-            if out_base
-            else midi_file.with_suffix(".wav")
-        )
-        wav_path.parent.mkdir(parents=True, exist_ok=True)
-        if wav_path.exists() and not args.overwrite:
-            print(f"スキップ（既存）: {wav_path}")
-            continue
-        try:
-            midi_to_wav_with_fs(fs, midi_file, wav_path)
-            converted += 1
-        except Exception as e:
-            print(f"失敗: {midi_file} -> {e}")
-
-    print(f"処理完了: {converted} ファイル変換")
 
 if __name__ == "__main__":
     main()

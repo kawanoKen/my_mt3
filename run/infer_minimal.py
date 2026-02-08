@@ -139,8 +139,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", type=str, required=True, help="model state_dict (.pt)")
     ap.add_argument("--root", type=str, default="dataset/groove", help="GrooveMIDI root (contains info.csv)")
-    ap.add_argument("--split", type=str, default="test", choices=["train", "validation", "test"])
-    ap.add_argument("--out_dir", type=str, default="outputs/groove_test_pred")
+    ap.add_argument("--split", type=str, default="validation", choices=["train", "validation", "test"])
+    # 単体ファイル推論用
+    ap.add_argument("--wav", type=str, help="入力WAVファイル（単体推論）")
+    ap.add_argument("--out", type=str, help="出力MIDIパス（--wav 指定時）")
+    ap.add_argument("--out_dir", type=str, default="outputs/groove_validation_pred")
     ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--sr", type=int, default=16000)
     ap.add_argument("--n_fft", type=int, default=2048)
@@ -152,15 +155,7 @@ def main():
     ap.add_argument("--cache_dir", type=str, default="cache/wave_sr16000")
     args = ap.parse_args()
 
-    out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
     chunk_sec = INPUT_FRAMES * args.hop / args.sr
-
-    # --- collect test pairs ---
-    pairs = collect_pairs_groove(args.root, split=args.split, program_id=args.program_id)
-    if len(pairs) == 0:
-        raise RuntimeError("No test pairs found. Check root/info.csv paths.")
-    print(f"pairs[{args.split}]: {len(pairs)}")
 
     # --- model ---
     model = MT3Mini(vocab_size=len(VOCAB.itos)).to(args.device)
@@ -171,6 +166,42 @@ def main():
     model.eval()
 
     mel_cfg = LogMelCfg(sr=args.sr, n_fft=args.n_fft, hop=args.hop, n_mels=args.n_mels)
+
+    # --- single file mode ---
+    if args.wav:
+        wav_path = Path(args.wav)
+        if not wav_path.is_file():
+            raise SystemExit(f"file not found: {wav_path}")
+        out_path = Path(args.out) if args.out else wav_path.with_suffix(".pred.mid")
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        a_path = wav_path
+        if args.use_cache and not str(wav_path).endswith(".npy"):
+            a_path = Path(ensure_wave_cache(str(wav_path), cache_dir=args.cache_dir, sr=args.sr))
+
+        pm_pred = infer_one_song(
+            model,
+            str(a_path),
+            device=args.device,
+            sr=args.sr,
+            chunk_sec=chunk_sec,
+            mel_cfg=mel_cfg,
+            max_len=args.max_len,
+            pid=args.program_id,
+        )
+        pm_pred.write(str(out_path))
+        print(f"done -> {out_path}")
+        return
+
+    # --- directory/dataset mode ---
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # collect test pairs
+    pairs = collect_pairs_groove(args.root, split=args.split, program_id=args.program_id)
+    if len(pairs) == 0:
+        raise RuntimeError("No test pairs found. Check root/info.csv paths.")
+    print(f"pairs[{args.split}]: {len(pairs)}")
 
     for audio_path, midi_path, pid in tqdm(pairs, desc=f"infer {args.split}", unit="song"):
         a_path = audio_path

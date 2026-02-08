@@ -7,6 +7,8 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 import glob
 import os
+import argparse
+import re
 import torch
 from pathlib import Path
 import pandas as pd
@@ -24,6 +26,7 @@ def collect_pairs_groove(
     splits: tuple[str, ...] = ("train", "validation","test"),
     program_id: Optional[int] = 0,   # None にすると pairs から pid を外す
     require_exists: bool = True,     # 存在しないパスを弾く
+    beat_types: Optional[tuple[str, ...]] = None,  # 例: (r"^pop", r"^rock", r"^funk")
 ) -> Dict[str, List[tuple]]:
     """
     GrooveMIDI の info.csv を読んで splitごとに pairs を作る。
@@ -47,6 +50,13 @@ def collect_pairs_groove(
 
     for sp in splits:
         subset = df[df["split"] == sp]
+        # style列があり、beat_typesが与えられていればフィルタ
+        if beat_types is not None and "style" in df.columns:
+            pats = tuple(beat_types)
+            def _ok_style(s: str) -> bool:
+                s = str(s or "")
+                return any(re.search(p, s, flags=re.IGNORECASE) for p in pats)
+            subset = subset[subset["style"].apply(_ok_style)]
 
         # 1行ずつ pairs 化
         for audio_rel, midi_rel in zip(subset["audio_filename"], subset["midi_filename"]):
@@ -66,7 +76,12 @@ def collect_pairs_groove(
 
 
 if __name__ == "__main__":
-    pairs = collect_pairs_groove()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--styles", type=str, default="pop,rock,funk", help="style フィルタ（カンマ区切り, 正規表現可）")
+    args = ap.parse_args()
+    styles = tuple(f"^{s.strip()}" for s in args.styles.split(",") if s.strip())
+
+    pairs = collect_pairs_groove(beat_types=styles)
     print(f"train pairs: {len(pairs['train'])} validation pairs: {len(pairs['validation'])} test pairs: {len(pairs['test'])}")
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     save_dir = os.path.join("checkpoints", f"run_{timestamp}")

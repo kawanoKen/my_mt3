@@ -206,8 +206,28 @@ def train_loop_distributed(
 
     if rank == 0:
         os.makedirs(save_dir, exist_ok=True)
+        # cache_dir を絶対パスに正規化し、事前作成（全rankで使うため）
+        if use_cache and cache_dir:
+            cache_dir_abs = os.path.abspath(cache_dir)
+            os.makedirs(cache_dir_abs, exist_ok=True)
+            cache_dir = cache_dir_abs
+    # すべてのrankがディレクトリ作成完了を待つ
+    dist.barrier()
 
     # 1) cache（splitごとに適用）
+    # rank0 で絶対化した cache_dir をブロードキャストして全rankで一致させる
+    if use_cache and cache_dir:
+        # 文字列長を共有 → バイト列共有（簡易実装）
+        cache_dir_bytes = os.path.abspath(cache_dir).encode("utf-8") if rank == 0 else b""
+        # 長さ共有
+        import torch as _torch
+        length_tensor = _torch.tensor([len(cache_dir_bytes)], dtype=_torch.int32, device=device)
+        dist.broadcast(length_tensor, src=0)
+        buf = _torch.empty((int(length_tensor.item()),), dtype=_torch.uint8, device=device)
+        if rank == 0:
+            buf.copy_(_torch.tensor(list(cache_dir_bytes), dtype=_torch.uint8, device=device))
+        dist.broadcast(buf, src=0)
+        cache_dir = bytes(buf.cpu().numpy().tolist()).decode("utf-8")
     pairs = _maybe_cache_pairs_map(pairs, sr=sr, cache_dir=(cache_dir if use_cache else None))
 
     # 2) dataset

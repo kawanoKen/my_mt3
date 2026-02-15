@@ -20,18 +20,20 @@ DEFAULT_SR = 16000
 # -------------------------
 
 def chunk_indices(total_sec: float, chunk_sec: float = 2.048, include_last: bool = True):
-    """
-    0, chunk_sec, 2*chunk_sec... の固定境界で区切るチャンク列を返す。
-    out: [(s_sec, e_sec), ...]
-    """
     t, out, eps = 0.0, [], 5e-3
     while t + chunk_sec <= total_sec + eps:
         out.append((t, min(t + chunk_sec, total_sec)))
         t += chunk_sec
-    # total_sec < chunk_sec の短い音声でも1チャンク返したい場合
+
+    # 端数が残るなら最後に追加
+    if include_last and t < total_sec - eps:
+        out.append((t, total_sec))
+
+    # total_sec < chunk_sec の短い音声でも1チャンク返す
     if include_last and not out and total_sec > 0:
         out.append((0.0, min(chunk_sec, total_sec)))
     return out
+
 
 
 def ms_quantize(timesec: float, step_ms: int = 10) -> int:

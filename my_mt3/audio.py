@@ -53,6 +53,7 @@ def ensure_wave_cache(
     sr: int = DEFAULT_SR,
 ) -> str:
     cache_dir_p = Path(cache_dir)
+    # 親ディレクトリを必ず作っておく（DDP/並列時の競合を最小化）
     cache_dir_p.mkdir(parents=True, exist_ok=True)
 
     key = _cache_key(wav_path)
@@ -66,8 +67,26 @@ def ensure_wave_cache(
     # ★重要: tmp も ".npy" で終わらせる（np.save が勝手に拡張子を付けないように）
     tmp_path = str(out_path) + ".tmp.npy"
 
+    # tmp を同一ディレクトリに作成してから原子的に置換
+    # 念のため親ディレクトリを再作成（並列時の競合対策）
+    Path(tmp_path).parent.mkdir(parents=True, exist_ok=True)
     np.save(tmp_path, y)
-    os.replace(tmp_path, out_path)  # 原子的に置換
+    try:
+        os.replace(tmp_path, out_path)  # 原子的に置換
+    except FileNotFoundError:
+        # まれに並列で親が消えた/まだ無い/保存先が消えた等。再作成して再試行
+        cache_dir_p.mkdir(parents=True, exist_ok=True)
+        # tmp が消えていたら再保存
+        if not os.path.exists(tmp_path):
+            np.save(tmp_path, y)
+        os.replace(tmp_path, out_path)
+    except FileExistsError:
+        # 他プロセスが先に作成済みならOK
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
 
     return str(out_path)
 

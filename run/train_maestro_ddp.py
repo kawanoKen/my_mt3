@@ -24,6 +24,7 @@ import pandas as pd
 import warnings
 
 from my_mt3.train import train_loop_distributed
+from my_mt3.tokenizer import build_vocab, INPUT_FRAMES
 
 # torchaudio / numpy 由来の冗長な UserWarning を抑制（任意）
 warnings.filterwarnings("ignore", category=UserWarning, module="torchaudio")
@@ -78,7 +79,7 @@ if __name__ == "__main__":
     ap.add_argument("--epochs", type=int, default=2000)
     ap.add_argument("--bs", type=int, default=8)
     ap.add_argument("--lr", type=float, default=2e-4)
-    ap.add_argument("--save-every", type=int, default=5)
+    ap.add_argument("--save-every", type=int, default=100)
     ap.add_argument("--save-dir", type=str, default=None, help="未指定なら checkpoints_maestro/run_YYYYmmdd_HHMMSS")
     ap.add_argument("--no-cache", action="store_true", help="波形キャッシュを無効化")
     ap.add_argument("--cache-dir", type=str, default="cache/wave_sr16000")
@@ -98,6 +99,10 @@ if __name__ == "__main__":
     print(f"train pairs: {len(pairs['train'])} | validation pairs: {len(pairs['validation'])}")
     print(f"📁 Checkpoints will be saved to: {save_dir}")
 
+    # ===== Vocab をここで固定生成 =====
+    # MAESTRO（ピアノ）前提: piano / Note Off なし / tie あり（既定）
+    vocab = build_vocab(input_frames=INPUT_FRAMES, instrument_type="piano", include_note_off=True)
+
     # DDP 版の最小トレーニングループを実行
     model = train_loop_distributed(
         pairs,
@@ -109,6 +114,8 @@ if __name__ == "__main__":
         use_cache=(not args.no_cache),
         cache_dir=args.cache_dir,
         sr=args.sr,
+        vocab=vocab,
+        num_workers=8
     )
     print(f"✅ Training finished. Saved to: {save_dir}")
 

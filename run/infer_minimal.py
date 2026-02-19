@@ -24,12 +24,14 @@ import pandas as pd
 import torch
 import pretty_midi
 from tqdm import tqdm
+from typing import List, Optional
+
 
 from my_mt3.model import MT3Mini
-from my_mt3.tokenizer import VOCAB, INPUT_FRAMES
+from my_mt3.tokenizer import build_vocab, INPUT_FRAMES, Vocab, VOCAB_PIANO 
 from my_mt3.dataset import chunk_indices, LogMelCfg, LogMelExtractor   # ← dataset.py にある前提
 from my_mt3.audio import load_audio_mono, ensure_wave_cache, DEFAULT_SR
-from my_mt3.infer import greedy_decode, to_midi_from_tokens            # ← 既存関数の想定
+from my_mt3.infer import greedy_decode, to_midi_from_tokens            # ← 汎用（固定長、NOF未使用）
 
 
 def collect_pairs_groove(
@@ -53,87 +55,203 @@ def collect_pairs_groove(
     return pairs
 
 
-def shift_and_merge_pm(dst: pretty_midi.PrettyMIDI, src: pretty_midi.PrettyMIDI, t0: float):
+
+def make_start_samples(
+    total_samples: int,
+    *,
+    need_samples: int,
+    hop: int,
+    mode: str = "test",
+    input_frames: int = 256,
+    stride_frames: Optional[int] = None,
+    include_last: bool = True,
+    max_chunks_per_song: Optional[int] = None,  # train相当をやりたいなら使う
+    rng: Optional[np.random.Generator] = None,
+) -> List[int]:
     """
-    src のノートを t0 秒だけシフトして dst に追加
+    AMTDataset._make_start_samples と同じ思想で、window開始サンプルssを作る。
+    推論では通常 mode="test" 相当（決定論的走査）を使う。
     """
-    # 楽器の program / is_drum が一致するものがあればそこへ、なければ新規作成
-    for inst in src.instruments:
-        # 既存探す
-        target = None
-        for di in dst.instruments:
-            if di.program == inst.program and di.is_drum == inst.is_drum and di.name == inst.name:
-                target = di
-                break
-        if target is None:
-            target = pretty_midi.Instrument(program=inst.program, is_drum=inst.is_drum, name=inst.name)
-            dst.instruments.append(target)
+    max_start = max(0, total_samples - need_samples)
+
+    if mode == "train":
+        # 推論で train 風にサンプルするケースは稀だが、一応用意
+        if max_chunks_per_song is None:
+            # 全列挙に近くなるので注意
+            return list(range(0, max_start + 1, need_samples))
+        K = int(max_chunks_per_song)
+        if rng is None:
+            rng = np.random.default_rng()
+        if max_start == 0:
+            starts = [0] * K
+        else:
+            starts = rng.integers(0, max_start + 1, size=K).tolist()
+        starts.sort()
+        return starts
+
+    # val/test: 決定論的スライド
+    if stride_frames is None:
+        stride_frames = input_frames
+    stride_samples = int(stride_frames) * hop
+    if stride_samples <= 0:
+        raise ValueError(f"stride_samples must be > 0, got {stride_samples}")
+
+    starts = list(range(0, max_start + 1, stride_samples))
+
+    if include_last:
+        if len(starts) == 0:
+            starts = [0]
+        else:
+            last = starts[-1]
+            if last != max_start and (max_start - last) > 0:
+                starts.append(max_start)
+
+    return starts
+
+
+def shift_and_merge_pm(out_pm: pretty_midi.PrettyMIDI, pm_chunk: pretty_midi.PrettyMIDI, *, t0: float) -> None:
+    """
+    チャンクMIDIを t0 秒シフトして out_pm にマージ。
+    - programが同じ instrument が out_pm にあればそこへ追加
+    - なければ instrument を新規追加
+    """
+    # program -> instrument index
+    prog2idx = {inst.program: idx for idx, inst in enumerate(out_pm.instruments)}
+
+    for inst in pm_chunk.instruments:
+        prog = int(inst.program)
+        if prog in prog2idx:
+            dst = out_pm.instruments[prog2idx[prog]]
+        else:
+            dst = pretty_midi.Instrument(program=prog, is_drum=inst.is_drum, name=inst.name)
+            out_pm.instruments.append(dst)
+            prog2idx[prog] = len(out_pm.instruments) - 1
 
         for n in inst.notes:
-            target.notes.append(
+            dst.notes.append(
                 pretty_midi.Note(
-                    velocity=n.velocity,
-                    pitch=n.pitch,
-                    start=float(n.start) + t0,
-                    end=float(n.end) + t0,
+                    velocity=int(n.velocity),
+                    pitch=int(n.pitch),
+                    start=float(n.start) + float(t0),
+                    end=float(n.end) + float(t0),
                 )
             )
+
+    # 任意：ノートを時刻順に整列
+    for inst in out_pm.instruments:
+        inst.notes.sort(key=lambda n: (n.start, n.pitch))
 
 
 @torch.no_grad()
 def infer_one_song(
-    model: MT3Mini,
+    model,
     audio_path: str,
     *,
-    device: str,
-    sr: int,
-    chunk_sec: float,
-    mel_cfg: LogMelCfg,
-    max_len: int,
-    pid: int,
+    device: str = "cuda",
+    sr: int = 16000,
+    hop: int = 256,
+    n_fft: int = 2048,
+    n_mels: int = 256,
+    input_frames: int = 256,
+    step_ms: int = 10,
+    program_id: int = 0,
+    vocab: Vocab = VOCAB_PIANO,
+    max_len: int = 1024,
+    # window sweep options
+    stride_frames: Optional[int] = None,     # None => input_frames（非オーバーラップ）
+    include_last: bool = True,
+    # train風サンプルがしたいなら
+    mode: str = "test",                      # "test"/"val"/"train"
+    max_chunks_per_song: Optional[int] = None,
 ) -> pretty_midi.PrettyMIDI:
     """
-    1曲を chunk に分けて推論し、PrettyMIDI を返す
-    """
-    y, _ = load_audio_mono(audio_path, sr=sr)
-    total_sec = float(len(y)) / float(sr)
+    AMTDataset と同じ窓定義で 1曲推論する。
 
-    feat = LogMelExtractor(mel_cfg)
+    - 波形を sr へ resample & mono 化して y:[N] を得る
+    - window = need_samples サンプル固定で切り出す（末尾不足は0-pad）
+    - center=False の log-mel を計算し、必ず [input_frames, n_mels] に揃える
+    - greedy_decode で token列生成
+    - tokens->MIDI（窓内0起点）を t0 シフトして曲全体へマージ
+
+    Returns:
+      out_pm: pretty_midi.PrettyMIDI（曲全体）
+    """
+    model.eval()
+
+    # ---- audio ----
+    y, _ = load_audio_mono(audio_path, sr=sr)
+    total_samples = int(len(y))
+
+    # ---- feature extractor（学習と同一設定）----
+    feat = LogMelExtractor(LogMelCfg(sr=sr, n_fft=n_fft, hop=hop, n_mels=n_mels))
+
+    # ---- datasetと同じ窓長 ----
+    need_samples = (int(input_frames) - 1) * int(hop) + int(n_fft)
+    window_sec = need_samples / float(sr)
+
+    # 参考（推論ではtoken側エンコードしないがデバッグ用）
+    frame_max_template = int(round(window_sec * 1000.0 / float(step_ms)))
+    frame_max_token = max(0, frame_max_template - 1)
+
+    # ---- window starts（dataset同等）----
+    starts = make_start_samples(
+        total_samples,
+        need_samples=need_samples,
+        hop=hop,
+        mode=mode,
+        input_frames=input_frames,
+        stride_frames=stride_frames,
+        include_last=include_last,
+        max_chunks_per_song=max_chunks_per_song,
+    )
 
     out_pm = pretty_midi.PrettyMIDI()
-    for s, e in chunk_indices(total_sec, chunk_sec=chunk_sec, include_last=True):
-        ss = int(round(s * sr))
-        ee = int(round(e * sr))
-        if ee <= ss:
-            continue
-        y_seg = y[ss:ee].astype(np.float32, copy=False)
 
-        # center=False のため n_fft 未満は pad（フレーム0を避ける）
-        if len(y_seg) < mel_cfg.n_fft:
-            y_seg = np.pad(y_seg, (0, mel_cfg.n_fft - len(y_seg)), mode="constant")
+    for ss in starts:
+        ee = ss + need_samples
+        y_seg = y[ss:ee]
 
-        mel = feat(y_seg)  # [T, n_mels]
-        mel_t = torch.from_numpy(mel).float().unsqueeze(0).to(device)  # [1, T, F]
+        # 末尾不足は0-padして固定長に（dataset同等）
+        if len(y_seg) < need_samples:
+            y_seg = np.pad(y_seg, (0, need_samples - len(y_seg)), mode="constant")
 
-        # --- decode ---
-        # greedy_decode のシグネチャはプロジェクト依存なので、合わなければここだけ調整してください
+        # mel: [input_frames, n_mels] のはず
+        mel = feat(y_seg)
+
+        # 保険（理論上一致する）
+        if mel.shape[0] != input_frames:
+            if mel.shape[0] > input_frames:
+                mel = mel[:input_frames]
+            else:
+                padT = input_frames - mel.shape[0]
+                mel = np.pad(mel, ((0, padT), (0, 0)), mode="constant")
+
+        # ---- model input: [1, T, F] ----
+        mel_t = torch.from_numpy(mel).to(device=device, dtype=torch.float32).unsqueeze(0)
+
+        # ---- decode ----
         token_ids = greedy_decode(
             model,
             mel_t,
             max_len=max_len,
             device=device,
-            program_id=int(pid)
+            program_id=int(program_id),
+            vocab=vocab,
         )
 
-        # --- tokens -> MIDI (chunk内) ---
-        # to_midi_from_tokens もプロジェクト依存。pid が必要なら渡してください。
-        pm_chunk = to_midi_from_tokens(token_ids, program_id=pid)
+        # ---- tokens -> MIDI (window内0起点) ----
+        pm_chunk = to_midi_from_tokens(
+            token_ids,
+            program_id=int(program_id),
+            step_ms=int(step_ms),
+            vocab=vocab,
+        )
 
-        # --- shift by chunk start ---
-        shift_and_merge_pm(out_pm, pm_chunk, t0=float(s))
+        # ---- shift by window start ----
+        s_sec = ss / float(sr)
+        shift_and_merge_pm(out_pm, pm_chunk, t0=float(s_sec))
 
     return out_pm
-
 
 def main():
     ap = argparse.ArgumentParser()
@@ -155,17 +273,14 @@ def main():
     ap.add_argument("--cache_dir", type=str, default="cache/wave_sr16000")
     args = ap.parse_args()
 
-    chunk_sec = INPUT_FRAMES * args.hop / args.sr
-
     # --- model ---
-    model = MT3Mini(vocab_size=len(VOCAB.itos)).to(args.device)
+    vocab = build_vocab(input_frames=INPUT_FRAMES, instrument_type="piano", include_note_off=True)
+    model = MT3Mini(vocab_size=len(vocab.itos)).to(args.device)
     sd = torch.load(args.ckpt, map_location="cpu")
     if any(k.startswith("module.") for k in sd.keys()):
         sd = {k[len("module."):]: v for k, v in sd.items()}
     model.load_state_dict(sd, strict=True)
     model.eval()
-
-    mel_cfg = LogMelCfg(sr=args.sr, n_fft=args.n_fft, hop=args.hop, n_mels=args.n_mels)
 
     # --- single file mode ---
     if args.wav:
@@ -184,10 +299,13 @@ def main():
             str(a_path),
             device=args.device,
             sr=args.sr,
-            chunk_sec=chunk_sec,
-            mel_cfg=mel_cfg,
+            hop=args.hop,
+            n_fft=args.n_fft,
+            n_mels=args.n_mels,
+            input_frames=INPUT_FRAMES,
             max_len=args.max_len,
-            pid=args.program_id,
+            program_id=args.program_id,
+            vocab=vocab,
         )
         pm_pred.write(str(out_path))
         print(f"done -> {out_path}")
@@ -217,10 +335,13 @@ def main():
             a_path,
             device=args.device,
             sr=args.sr,
-            chunk_sec=chunk_sec,
-            mel_cfg=mel_cfg,
+            hop=args.hop,
+            n_fft=args.n_fft,
+            n_mels=args.n_mels,
+            input_frames=INPUT_FRAMES,
             max_len=args.max_len,
-            pid=pid,
+            program_id=pid,
+            vocab=vocab,
         )
         pm_pred.write(str(out_mid))
 

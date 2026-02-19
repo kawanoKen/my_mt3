@@ -11,7 +11,7 @@ import torchaudio
 import pretty_midi
 from torch.utils.data import Dataset
 from my_mt3.audio import load_audio_mono, LogMelExtractor, LogMelCfg
-from my_mt3.tokenizer import encode_events, INPUT_FRAMES
+from my_mt3.tokenizer import encode_events, INPUT_FRAMES, Vocab
 import random
 
 DEFAULT_SR = 16000
@@ -65,7 +65,9 @@ class AMTDataset(Dataset):
         include_last: bool = True,
         n_fft: int = 2048,
         n_mels: int = 256,
+        vocab: Vocab,
     ):
+        self.vocab = vocab
         self.pairs = pairs
         self.mode = mode
         self.sr = sr
@@ -196,7 +198,7 @@ class AMTDataset(Dataset):
 
                 ev.append((on_q, off_q, p))
 
-            token_ids = encode_events(ev, pid, ties, frame_max_token=self.frame_max_token)
+            token_ids = encode_events(ev, pid, ties, frame_max_token=self.frame_max_token, vocab=self.vocab)
             chunks.append((mel, token_ids, (s_sec, e_sec)))
 
         return chunks

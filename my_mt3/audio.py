@@ -64,22 +64,39 @@ def ensure_wave_cache(
 
     y = load_wav_mono_resample(wav_path, sr=sr)
 
-    # ★重要: tmp も ".npy" で終わらせる（np.save が勝手に拡張子を付けないように）
-    tmp_path = str(out_path) + ".tmp.npy"
-
-    # tmp を同一ディレクトリに作成してから原子的に置換
+    # ★重要: ユニークな一時ファイルを使う（並列時のtmp競合を回避）
+    import tempfile
+    fd, tmp_path = tempfile.mkstemp(
+        dir=str(cache_dir_p),
+        prefix=out_path.stem + ".",
+        suffix=".tmp.npy",
+    )
+    os.close(fd)  # いったん閉じてからnp.saveで書く
     # 念のため親ディレクトリを再作成（並列時の競合対策）
     Path(tmp_path).parent.mkdir(parents=True, exist_ok=True)
     np.save(tmp_path, y)
     try:
         os.replace(tmp_path, out_path)  # 原子的に置換
     except FileNotFoundError:
-        # まれに並列で親が消えた/まだ無い/保存先が消えた等。再作成して再試行
+        # まれに並列で他プロセスが既に置換済みでtmpが消えたケース
+        if out_path.exists():
+            # 目的物が既に存在するならOK
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
+            return str(out_path)
+        # それでも存在しない場合は再試行
         cache_dir_p.mkdir(parents=True, exist_ok=True)
-        # tmp が消えていたら再保存
         if not os.path.exists(tmp_path):
             np.save(tmp_path, y)
-        os.replace(tmp_path, out_path)
+        try:
+            os.replace(tmp_path, out_path)
+        except Exception:
+            # 最後の保険：他プロセスが勝ったらOK
+            if not out_path.exists():
+                raise
     except FileExistsError:
         # 他プロセスが先に作成済みならOK
         if os.path.exists(tmp_path):

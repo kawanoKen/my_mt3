@@ -29,3 +29,6 @@ dataset/
 checkpoints/
 maestro-v3.0.0/
 checkpoints_maestro/
+checkpoints*/
+
+output/

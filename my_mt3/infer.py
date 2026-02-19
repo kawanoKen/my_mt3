@@ -3,13 +3,16 @@ from __future__ import annotations
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import pretty_midi
+from typing import Optional, Tuple
 
-from .tokenizer import VOCAB
+
+from my_mt3.tokenizer import Vocab, VOCAB as DEFAULT_VOCAB, VOCAB_PIANO
 
 
 @torch.no_grad()
-def greedy_decode(model, mel, *, max_len: int = 1024, device: str = "cuda", program_id=0):
+def greedy_decode(model, mel, *, max_len: int = 1024, device: str = "cuda", program_id=0, vocab: Vocab | None = None):
     """
     Args:
       model: MT3Mini
@@ -36,18 +39,13 @@ def greedy_decode(model, mel, *, max_len: int = 1024, device: str = "cuda", prog
     # ---- encode ----
     mem = model.enc(mel_t)
 
-    # ---- BOS: 最小の program token を使う（安定）----
-    if hasattr(VOCAB, "program") and isinstance(VOCAB.program, dict) and len(VOCAB.program) > 0:
-        bos_id = int(min(VOCAB.program.values()))
-    else:
-        bos_id = int(getattr(VOCAB, "bos", None) or getattr(VOCAB, "eos"))
+    # 語彙の解決
+    vocab = DEFAULT_VOCAB if vocab is None else vocab
 
-    eos_id = int(VOCAB.eos)
+    # ---- BOS/EOS ----
+    eos_id = int(vocab.eos)
     prg_key = f"PRG_{int(program_id)}"
-    bos_id = VOCAB.program.get(prg_key, int(min(VOCAB.program.values())))
-    y = torch.full((1, 1), int(bos_id), dtype=torch.long, device=device)
-
-    # y: [1,1]
+    bos_id = int(vocab.program.get(prg_key, int(min(vocab.program.values()))))
     y = torch.full((1, 1), bos_id, dtype=torch.long, device=device)
 
     out = []
@@ -67,6 +65,70 @@ def greedy_decode(model, mel, *, max_len: int = 1024, device: str = "cuda", prog
     return out
 
 
+
+@torch.no_grad()
+def greedy_decode_with_probs(
+    model,
+    mel: torch.Tensor,              # [B,T,F]
+    *,
+    program_id: int,
+    vocab,
+    max_len: int = 1024,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Returns:
+      out:    [B,S] generated tokens (PRGは含まない)
+      pmax:   [B,S]
+      margin: [B,S]
+    """
+
+    device = mel.device
+    B = mel.size(0)
+
+    # --- PRG token が decoder の開始 ---
+    prg_key = f"PRG_{int(program_id)}"
+    prg_id = vocab.program[prg_key]
+    y = torch.full((B, 1), prg_id, dtype=torch.long, device=device)
+
+    mem = model.enc(mel)
+
+    out = torch.full((B, max_len), vocab.pad, dtype=torch.long, device=device)
+    pmax = torch.zeros((B, max_len), device=device)
+    margin = torch.zeros((B, max_len), device=device)
+
+    finished = torch.zeros(B, dtype=torch.bool, device=device)
+
+    for t in range(max_len):
+        logits = model.dec(y, mem)[:, -1, :]   # [B,V]
+        probs = F.softmax(logits, dim=-1)
+
+        top2 = torch.topk(probs, 2, dim=-1).values
+        p1 = top2[:, 0]
+        p2 = top2[:, 1]
+        m = p1 - p2
+
+        nxt = torch.argmax(logits, dim=-1)     # [B]
+
+        # write
+        nxt_write = torch.where(finished, torch.full_like(nxt, vocab.pad), nxt)
+        out[:, t] = nxt_write
+        pmax[:, t] = torch.where(finished, torch.zeros_like(p1), p1)
+        margin[:, t] = torch.where(finished, torch.zeros_like(m), m)
+
+        # EOS処理
+        just_finished = (nxt == vocab.eos) & (~finished)
+        finished = finished | just_finished
+
+        y = torch.cat([y, nxt_write.unsqueeze(1)], dim=1)
+
+        if finished.all():
+            break
+
+    return out, pmax, margin
+
+
+
+
 def to_midi_from_tokens(
     token_ids,
     *,
@@ -74,6 +136,7 @@ def to_midi_from_tokens(
     step_ms: int = 10,
     velocity: int = 80,
     default_dur_ms: int = 50,
+    vocab: Vocab | None = None,
 ):
     """
     Args:
@@ -84,6 +147,9 @@ def to_midi_from_tokens(
     Returns:
       pretty_midi.PrettyMIDI
     """
+    # 語彙の解決
+    vocab = DEFAULT_VOCAB if vocab is None else vocab
+
     pm = pretty_midi.PrettyMIDI()
     inst = pretty_midi.Instrument(program=int(program_id))
 
@@ -92,14 +158,14 @@ def to_midi_from_tokens(
     # --- 旧実装（Note Off あり）の参考 ---
     # onsets = {}  # pitch -> onset_ms
 
-    eos_id = int(VOCAB.eos)
+    eos_id = int(vocab.eos)
 
     for tid in token_ids:
         tid = int(tid)
         if tid == eos_id:
             break
 
-        tok = VOCAB.itos[tid]
+        tok = vocab.itos[tid]
 
         if tok.startswith("TIM_"):
             # TIM_k は「絶対時刻 k*step_ms」扱い（あなたの実装準拠）
@@ -136,6 +202,99 @@ def to_midi_from_tokens(
         else:
             # MVP: 未知トークンは無視
             continue
+
+    pm.instruments.append(inst)
+    return pm
+
+
+def to_midi_from_tokens_piano(
+    token_ids,
+    *,
+    program_id: int = 0,
+    step_ms: int = 10,
+    velocity: int = 80,
+    default_dur_ms: int = 50,
+    vocab: Vocab | None = None,
+):
+    """
+    Piano想定（Note Off 対応）のデコーダ。
+    - TIM_k: 絶対時刻を k*step_ms に設定
+    - NON_p: pitch=p のノート開始（既にONなら直前ノートを現在時刻までで確定）
+    - NOF_p: pitch=p のノート終了（onsets から取り出してノート確定）
+    - end_tie は情報を持たないマーカーのため復元では無視（学習のヒント用）
+    """
+    vocab = VOCAB_PIANO if vocab is None else vocab
+
+    pm = pretty_midi.PrettyMIDI()
+    inst = pretty_midi.Instrument(program=int(program_id))
+
+    cur_ms = 0
+    onsets: dict[int, int] = {}  # pitch -> onset_ms
+
+    eos_id = int(vocab.eos)
+
+    for tid in token_ids:
+        tid = int(tid)
+        if tid == eos_id:
+            break
+
+        tok = vocab.itos[tid]
+
+        if tok.startswith("TIM_"):
+            k = int(tok.split("_")[1])
+            cur_ms = k * int(step_ms)
+
+        elif tok.startswith("NON_"):
+            p = int(tok.split("_")[1])
+            if p in onsets:
+                on_ms = onsets.pop(p)
+                off_ms = cur_ms
+                if off_ms <= on_ms:
+                    off_ms = on_ms + max(1, int(default_dur_ms))
+                inst.notes.append(
+                    pretty_midi.Note(
+                        velocity=int(velocity),
+                        pitch=p,
+                        start=on_ms / 1000.0,
+                        end=off_ms / 1000.0,
+                    )
+                )
+            # start new
+            onsets[p] = cur_ms
+
+        elif tok.startswith("NOF_"):
+            p = int(tok.split("_")[1])
+            if p in onsets:
+                on_ms = onsets.pop(p)
+                off_ms = cur_ms
+                if off_ms <= on_ms:
+                    off_ms = on_ms + max(1, int(default_dur_ms))
+                inst.notes.append(
+                    pretty_midi.Note(
+                        velocity=int(velocity),
+                        pitch=p,
+                        start=on_ms / 1000.0,
+                        end=off_ms / 1000.0,
+                    )
+                )
+            # 未対応の NOF は無視
+        else:
+            # それ以外（end_tie等）は復元情報を持たないため無視
+            continue
+
+    # 残っているノートを適当に閉じる（安全策）
+    if onsets:
+        tail_ms = cur_ms + int(default_dur_ms)
+        for p, on_ms in onsets.items():
+            off_ms = tail_ms if tail_ms > on_ms else on_ms + max(1, int(default_dur_ms))
+            inst.notes.append(
+                pretty_midi.Note(
+                    velocity=int(velocity),
+                    pitch=p,
+                    start=on_ms / 1000.0,
+                    end=off_ms / 1000.0,
+                )
+            )
 
     pm.instruments.append(inst)
     return pm

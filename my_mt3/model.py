@@ -1,6 +1,28 @@
 # amtx/model.py
 import torch, torch.nn as nn, math
 
+import copy
+
+class EMATeacher:
+    def __init__(self, student_module: torch.nn.Module, decay: float = 0.999):
+        self.decay = decay
+        self.teacher = copy.deepcopy(student_module).eval()
+        for p in self.teacher.parameters():
+            p.requires_grad_(False)
+
+    @torch.no_grad()
+    def update(self, student_module: torch.nn.Module):
+        d = self.decay
+        msd = student_module.state_dict()
+        tsd = self.teacher.state_dict()
+        for k in tsd.keys():
+            if tsd[k].dtype.is_floating_point:
+                tsd[k].mul_(d).add_(msd[k], alpha=1.0 - d)
+            else:
+                tsd[k].copy_(msd[k])  # int buffers etc
+        self.teacher.load_state_dict(tsd, strict=True)
+
+
 class PosEmb(nn.Module):
     def __init__(self, d, max_len=16384):
         super().__init__()

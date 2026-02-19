@@ -3,10 +3,13 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from .model import MT3Mini
-from .tokenizer import VOCAB
+from .tokenizer import Vocab, INPUT_FRAMES
 from .dataset import AMTDataset
+from .dataset_unlabeled import AMTRealDataset
+from .discriminator import Discriminator
 from .audio import ensure_wave_cache, DEFAULT_SR
 import os
+import itertools
 
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -51,26 +54,33 @@ def _maybe_cache_pairs_map(pairs_map, *, sr: int, cache_dir: str | None):
     return out
 
 
-def collate(batch):
-    items=[]
-    for chunks in batch:
-        for mel, ids, _ in chunks:
-            items.append((torch.tensor(mel, dtype=torch.float32),
-                          torch.tensor(ids, dtype=torch.long)))
-    if not items:
-        raise RuntimeError("No chunks produced. Check dataset/segmentation.")
+def make_collate(vocab: Vocab):
+    def _collate(batch):
+        items=[]
+        for chunks in batch:
+            for mel, ids, _ in chunks:
+                items.append((torch.tensor(mel, dtype=torch.float32),
+                              torch.tensor(ids, dtype=torch.long)))
+        if not items:
+            raise RuntimeError("No chunks produced. Check dataset/segmentation.")
 
-    maxL = max(len(ids) for _,ids in items)
-    ys_in = torch.full((len(items), maxL), VOCAB.pad, dtype=torch.long)
-    ys_tg = torch.full((len(items), maxL), VOCAB.pad, dtype=torch.long)
-    mels  = []
-    for i,(mel, ids) in enumerate(items):
-        mels.append(mel)
-        if len(ids) >= 2:
-            ys_in[i,:len(ids)-1] = ids[:-1]
-            ys_tg[i,:len(ids)-1] = ids[1:]
-    mels = nn.utils.rnn.pad_sequence(mels, batch_first=True)
-    return mels, ys_in, ys_tg
+        maxL = max(len(ids) for _,ids in items)
+        ys_in = torch.full((len(items), maxL), vocab.pad, dtype=torch.long)
+        ys_tg = torch.full((len(items), maxL), vocab.pad, dtype=torch.long)
+        mels  = []
+        for i,(mel, ids) in enumerate(items):
+            mels.append(mel)
+            if len(ids) >= 2:
+                ys_in[i,:len(ids)-1] = ids[:-1]
+                ys_tg[i,:len(ids)-1] = ids[1:]
+        mels = nn.utils.rnn.pad_sequence(mels, batch_first=True)
+        return mels, ys_in, ys_tg
+    return _collate
+
+
+def collate(batch, vocab: Vocab):
+    # Backward compatibility fallback using default vocab
+    return make_collate(vocab)(batch)
 
 
 @torch.no_grad()
@@ -100,28 +110,29 @@ def train_loop(
     cache_dir: str = "cache/wave_sr16000",
     sr: int = DEFAULT_SR,
     num_workers: int = 2,
+    vocab: Vocab,
 ):
     # 1) cache（splitごとに適用）
     pairs = _maybe_cache_pairs_map(pairs, sr=sr, cache_dir=(cache_dir if use_cache else None))
 
     # 2) dataset / dataloader（valは決定論・全曲）
-    train_ds = AMTDataset(pairs["train"], mode="train", sr=sr)
-    val_ds   = AMTDataset(pairs["validation"], mode="validation", sr=sr)
+    train_ds = AMTDataset(pairs["train"], mode="train", sr=sr, vocab=vocab)
+    val_ds   = AMTDataset(pairs["validation"], mode="validation", sr=sr, vocab=vocab)
 
     train_dl = DataLoader(
         train_ds, batch_size=bs, shuffle=True,
-        collate_fn=collate, num_workers=num_workers, pin_memory=True
+        collate_fn=make_collate(vocab), num_workers=num_workers, pin_memory=True
     )
     val_dl = DataLoader(
         val_ds, batch_size=bs, shuffle=False,
-        collate_fn=collate, num_workers=num_workers, pin_memory=True
+        collate_fn=make_collate(vocab), num_workers=num_workers, pin_memory=True
     )
 
     # 3) model
-    model = MT3Mini(vocab_size=len(VOCAB.itos)).to(device)
+    model = MT3Mini(vocab_size=len(vocab.itos)).to(device)
 
     opt = optim.AdamW(model.parameters(), lr=lr)
-    crit = nn.CrossEntropyLoss(ignore_index=VOCAB.pad)
+    crit = nn.CrossEntropyLoss(ignore_index=vocab.pad)
 
     print(f"train songs: {len(train_ds)} | val songs: {len(val_ds)}")
 
@@ -192,6 +203,7 @@ def train_loop_distributed(
     cache_dir: str = "cache/wave_sr16000",
     sr: int = DEFAULT_SR,
     num_workers: int = 2,
+    vocab: Vocab,
 ):
     # ---- init DDP ----
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -231,8 +243,8 @@ def train_loop_distributed(
     pairs = _maybe_cache_pairs_map(pairs, sr=sr, cache_dir=(cache_dir if use_cache else None))
 
     # 2) dataset
-    train_ds = AMTDataset(pairs["train"], mode="train", sr=sr)
-    val_ds   = AMTDataset(pairs["validation"], mode="validation", sr=sr)
+    train_ds = AMTDataset(pairs["train"], mode="train", sr=sr, vocab=vocab)
+    val_ds   = AMTDataset(pairs["validation"], mode="validation", sr=sr, vocab=vocab)
 
     # 3) sampler/loader（★drop_last=True が重要）
     train_sampler = DistributedSampler(train_ds, shuffle=True, drop_last=True)
@@ -243,7 +255,7 @@ def train_loop_distributed(
         batch_size=bs,
         sampler=train_sampler,
         shuffle=False,
-        collate_fn=collate,
+        collate_fn=make_collate(vocab),
         num_workers=num_workers,
         pin_memory=True,
         drop_last=True,   # ★重要
@@ -255,7 +267,7 @@ def train_loop_distributed(
         batch_size=bs,
         sampler=val_sampler,
         shuffle=False,
-        collate_fn=collate,
+        collate_fn=make_collate(vocab),
         num_workers=num_workers,
         pin_memory=True,
         drop_last=False,
@@ -263,11 +275,11 @@ def train_loop_distributed(
     )
 
     # 4) model
-    model = MT3Mini(vocab_size=len(VOCAB.itos)).to(device)
+    model = MT3Mini(vocab_size=len(vocab.itos)).to(device)
     model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
 
     opt = optim.AdamW(model.parameters(), lr=lr)
-    crit = nn.CrossEntropyLoss(ignore_index=VOCAB.pad)
+    crit = nn.CrossEntropyLoss(ignore_index=vocab.pad)
 
     if rank == 0:
         print(f"[DDP] world={world} | train songs={len(train_ds)} | val songs={len(val_ds)}")

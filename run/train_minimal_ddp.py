@@ -14,6 +14,7 @@ from pathlib import Path
 import pandas as pd
 from typing import Dict, List, Tuple, Optional
 from my_mt3.train import train_loop_distributed
+from my_mt3.tokenizer import build_vocab, INPUT_FRAMES
 import warnings
 from datetime import datetime
 
@@ -96,6 +97,8 @@ if __name__ == "__main__":
     save_dir = os.path.join("checkpoints", f"run_{timestamp}")
     os.makedirs(save_dir, exist_ok=True)
     print(f"📁 Checkpoints will be saved to: {save_dir}")
+    
+    vocab = build_vocab(input_frames=INPUT_FRAMES, instrument_type="drum", include_note_off=False)
 
     model = train_loop_distributed(
         pairs,
@@ -108,6 +111,7 @@ if __name__ == "__main__":
         use_cache=True,
         cache_dir="cache/wave_sr16000",
         sr=16000,
+        vocab=vocab,
     )
     print("saved -> saved checkpoints to {save_dir}")
 

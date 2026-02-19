@@ -82,7 +82,8 @@ def midi_to_wav(
             "-r",
             str(sr),
         ]
-        subprocess.run(args, check=True)
+        subprocess.run(args, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+
     finally:
         if tmp_midi_path and tmp_midi_path.exists():
             tmp_midi_path.unlink(missing_ok=True)

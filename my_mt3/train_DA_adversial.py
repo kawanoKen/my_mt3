@@ -21,7 +21,7 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.autograd import Function
 from my_mt3.train import _maybe_cache_pairs_map, make_collate
 from my_mt3.discriminator import grl
-from my_mt3.train_DA_confusion import eval_loop_ddp, decode_notes_to_spans, build_note_confidences, make_pseudo_token_mask_from_notes, apply_mask_to_targets, make_collate_real
+from my_mt3.train_DA_confusion import eval_loop_ddp, make_collate_real, pseudo_chunk_filter
 
 from dataclasses import dataclass
 from typing import List, Tuple, Dict
@@ -55,8 +55,10 @@ def train_loop_distributed_DA_adversial(
     ema_decay: float = 0.999,
     unsup_weight: float = 1.0,
     pseudo_max_len: int = 1024,
-    top_frac: float = 0.2,
-    bot_frac: float = 0.2,
+    pseudo_threshold: float = -0.5,
+    pseudo_topn: int = 0,
+    # ---- 事前学習重み ----
+    pretrained_ckpt: str | None = None,
     # ---- 既存 ----
     epochs=5,
     bs=8,
@@ -73,7 +75,7 @@ def train_loop_distributed_DA_adversial(
     device = torch.device(f"cuda:{local_rank}")
 
     if not dist.is_initialized():
-        dist.init_process_group(backend="nccl")
+        dist.init_process_group(backend="nccl", device_id=device)
 
     rank = dist.get_rank()
     world = dist.get_world_size()
@@ -164,6 +166,16 @@ def train_loop_distributed_DA_adversial(
 
     # ---- models ----
     model = MT3Mini(vocab_size=len(vocab.itos)).to(device)
+    if pretrained_ckpt is not None:
+        ckpt = torch.load(pretrained_ckpt, map_location=device, weights_only=True)
+        state = ckpt if not isinstance(ckpt, dict) else ckpt.get("model", ckpt)
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        if rank == 0:
+            print(f"[pretrained] loaded {pretrained_ckpt}")
+            if missing:
+                print(f"  missing keys : {missing}")
+            if unexpected:
+                print(f"  unexpected keys: {unexpected}")
     model_ddp = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
 
     crit_ce = nn.CrossEntropyLoss(ignore_index=vocab.pad)
@@ -221,7 +233,9 @@ def train_loop_distributed_DA_adversial(
             fast_dec = FastDecoderKV(ema.teacher.dec, max_len=pseudo_max_len).to(device).eval()
 
         for mels_s, y_in_s, y_tg_s in pbar:
-            mels_r = next(real_iter) if real_iter is not None else None
+            mels_r, _real_idxs, _real_starts = (None, None, None)
+            if real_iter is not None:
+                mels_r, _real_idxs, _real_starts = next(real_iter)
             if mels_r is not None:
                 mels_r = mels_r.to(device, non_blocking=True)
 
@@ -287,7 +301,7 @@ def train_loop_distributed_DA_adversial(
 
             if use_pseudo and real_dl is not None and (ep + 1) >= pseudo_start_epoch:
                 # teacher generate pseudo seq + token confidences
-                out, pmax, margin = pseudo_label_with_kvcache(
+                out, _pmax, _margin, log_prob = pseudo_label_with_kvcache(
                     teacher=ema.teacher,
                     fast_dec=fast_dec,
                     mel=mels_r,
@@ -298,37 +312,26 @@ def train_loop_distributed_DA_adversial(
                 )
 
                 B = out.size(0)
-                prg_id = int(vocab.program["PRG_0"])
+                prg_id = int(vocab.instrument_type["PRG_0"])
                 prg = torch.full((B, 1), prg_id, dtype=torch.long, device=out.device)
                 y_in_p = torch.cat([prg, out[:, :-1]], dim=1)
                 y_tg_p = out
 
-                # ---- NOTE: token->note mapping is project-specific ----
-                # You MUST provide:
-                #   note_spans = decode_notes_to_spans(y_pseudo[b].tolist(), vocab)
-                # that returns List[NoteSpan] where tok_ids are indices in y_tg_p[b]
-                token_masks = []
-                for b in range(out.size(0)):
-                    # pmax/margin are for steps excluding BOS: they align with y_tg_p positions
-                    pmax_b = pmax[b]      # [S-1]
-                    margin_b = margin[b]  # [S-1]
+                pad_id = int(vocab.pad)
+                eos_id = int(vocab.eos)
+                chunk_mask = pseudo_chunk_filter(
+                    out, log_prob,
+                    pad_id=pad_id, eos_id=eos_id, device=device,
+                    pseudo_threshold=pseudo_threshold,
+                    pseudo_topn=pseudo_topn,
+                )
 
-                    note_spans = decode_notes_to_spans(out[b].tolist(), vocab)
+                if chunk_mask.any():
+                    y_tg_masked = y_tg_p.clone()
+                    y_tg_masked[~chunk_mask] = pad_id
 
-                    conf1, conf2 = build_note_confidences(note_spans, pmax_b, margin_b)
-                    mask_b = make_pseudo_token_mask_from_notes(
-                        note_spans, conf1, conf2, seq_len_no_bos=y_tg_p.size(1),
-                        top_frac=top_frac, bot_frac=bot_frac
-                    )
-                    token_masks.append(mask_b)
-
-                token_mask = torch.stack(token_masks, dim=0).to(device)  # [B,S-1] bool
-
-                y_tg_masked = apply_mask_to_targets(y_tg_p, token_mask, ignore_index=vocab.pad)
-
-                # student predicts on real with teacher forcing using full pseudo prefix
-                logits_r = model_ddp.module.dec(y_in_p.to(device), mem_r)
-                loss_unsup = crit_ce(logits_r.reshape(-1, logits_r.size(-1)), y_tg_masked.to(device).reshape(-1))
+                    logits_r = model_ddp.module.dec(y_in_p.to(device), mem_r)
+                    loss_unsup = crit_ce(logits_r.reshape(-1, logits_r.size(-1)), y_tg_masked.to(device).reshape(-1))
 
 
             opt_t.zero_grad(set_to_none=True)
@@ -364,7 +367,7 @@ def train_loop_distributed_DA_adversial(
 
         # ---- val (optional) ----
         val_loss = 0.0
-        if (ep + 1) % save_every == 0 or (ep + 1) == epochs:
+        if (ep + 1) % 10 == 0 or (ep + 1) == epochs:
             val_loss = eval_loop_ddp(model_ddp, val_dl, crit_ce, device)
 
         if rank == 0:

@@ -24,9 +24,14 @@ class MidiTokCfg:
     # time_shift: [2 .. 2+max_shift_steps-1]
     # note_on:    next 128
     # note_off:   next 128
-    # total vocab = 2 + max_shift_steps + 128 + 128
-    def vocab_size(self) -> int:
+    # [MASK]:     last token (for MLM pre-training)
+    # total vocab = 2 + max_shift_steps + 128 + 128 + 1
+    @property
+    def mask_id(self) -> int:
         return 2 + self.max_shift_steps + 128 + 128
+
+    def vocab_size(self) -> int:
+        return 2 + self.max_shift_steps + 128 + 128 + 1
 
     def time_shift_id(self, steps_1_to_max: int) -> int:
         # steps is 1..max_shift_steps

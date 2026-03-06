@@ -5,7 +5,7 @@ import math
 # 基本設定
 # --------------------
 TIME_STEP_MS = 10
-PROGRAMS = ["piano", "guitar", "bass", "drums", "vocal"]
+INSTRUMENT_TYPES = ["piano", "guitar", "bass", "drums", "vocal"]
 PITCHES = list(range(128))
 
 INPUT_FRAMES = 256
@@ -17,10 +17,10 @@ INPUT_FRAMES = 256
 class Vocab:
     pad: int
     eos: int
-    end_tie: int | None  # drum 用は不要なので None を許容
-    program: dict
+    end_tie: int | None  
+    instrument_type: dict
     note_on: dict
-    note_off: dict | None  # オプション（存在すれば使用）
+    note_off: dict | None  
     time: dict
     itos: list
 
@@ -61,7 +61,7 @@ def build_vocab(
         # drum 用は tie を使わない
         end_tie = None
 
-    program = {f"PRG_{n}": add(f"PRG_{n}") for n, _ in enumerate(PROGRAMS)}
+    instrument_type = {f"PRG_{n}": add(f"PRG_{n}") for n, _ in enumerate(INSTRUMENT_TYPES)}
     note_on = {p: add(f"NON_{p}") for p in PITCHES}
     note_off = {p: add(f"NOF_{p}") for p in PITCHES} if include_note_off else None
     time = {t: add(f"TIM_{t}") for t in range(num_time)}
@@ -70,7 +70,7 @@ def build_vocab(
         pad=pad,
         eos=eos,
         end_tie=end_tie,
-        program=program,
+        instrument_type=instrument_type,
         note_on=note_on,
         note_off=note_off,
         time=time,
@@ -81,38 +81,44 @@ def build_vocab(
 def encode_events(note_events, program_id, ties, *, frame_max_token: int, vocab: Vocab):
     """
     note_events: [(on_t, off_t, pitch), ...]
-      - on_t/off_t は index（10ms刻み推奨）。Note Off は無視し、Note On のみ符号化します。
     program_id: int (PRG id)
-    ties: [(pitch, remaining_t), ...]  ※MVPでは宣言のみ。Note Off 無し仕様では未使用だが互換のため受け取る。
+    ties: [(pitch, remaining_t), ...]
+      tie section: <end_tie> NON_p1 NON_p2 ... の形で、前チャンクから
+      持ち越されたピッチを明示する。timeline では tie pitch の onset を省略し
+      offset(NOF) のみ出力する。
     frame_max_token: int
-      - このウィンドウ内で表現可能な最大 TIME index（例: 0..819）
-      - Dataset側で window_sec から計算した self.frame_max_token を渡すのが正解
     """
-    # ---- program token（辞書順に依存しない）----
+    # ---- program token ----
     prg_key = f"PRG_{int(program_id)}"
-    if prg_key not in vocab.program:
-        raise KeyError(f"{prg_key} not in vocab.program (keys={list(vocab.program.keys())[:5]}...)")
-    ids = [vocab.program[prg_key]]
+    if prg_key not in vocab.instrument_type:
+        raise KeyError(f"{prg_key} not in vocab.instrument_type (keys={list(vocab.instrument_type.keys())[:5]}...)")
+    ids = [vocab.instrument_type[prg_key]]
 
-    # ---- tie（MVP: 宣言だけ）----
-    # drum 語彙では end_tie は None のため付与しない
+    # ---- tie section: <end_tie> NON_p1 NON_p2 ... ----
+    tie_pitches: set[int] = set()
     if ties and getattr(vocab, "end_tie", None) is not None:
         ids.append(vocab.end_tie)
+        for p, _ in sorted(ties, key=lambda x: x[0]):
+            ids.append(vocab.note_on[int(p)])
+            tie_pitches.add(int(p))
 
     # ---- timeline: TIME index -> [("on", pitch), ...] ----
-    # VOCAB.note_off が存在する場合のみ "off" を登録する
     timeline: dict[int, list[tuple[str,int]]] = {}
     has_off = getattr(vocab, "note_off", None) is not None
     for on_t, off_t, p in note_events:
         on_t  = int(on_t)
         off_t = int(off_t)
         p     = int(p)
-        # clamping（負は0へ、上はframe_maxへ）
         on_t  = max(0, min(on_t,  frame_max_token))
         off_t = max(0, min(off_t, frame_max_token))
-        timeline.setdefault(on_t,  []).append(("on", p))
-        if has_off:
-            timeline.setdefault(off_t, []).append(("off", p))
+        if p in tie_pitches and on_t == 0:
+            # tie pitch: onset は tie section で既出。offset のみ timeline に残す
+            if has_off:
+                timeline.setdefault(off_t, []).append(("off", p))
+        else:
+            timeline.setdefault(on_t,  []).append(("on", p))
+            if has_off:
+                timeline.setdefault(off_t, []).append(("off", p))
 
     # ---- 時系列順に符号化（同時刻は on のみ）----
     for t in sorted(timeline.keys()):

@@ -1,6 +1,7 @@
 .venv
 __pycache__
 data/
+*/__pycache__
 
 # データ系
 *.wav
@@ -29,6 +30,16 @@ dataset/
 checkpoints/
 maestro-v3.0.0/
 checkpoints_maestro/
-checkpoints*/
+checkpoints_maestro_DA/
+checkpoints_maestro_SSL/
 
 output/
+outputs/
+YourMT3
+
+ckpt_conf_midi/
+
+ckpt_conf_mlm/
+onset_and_frames/runs/
+
+Discriminator/ckpt_conf_giantmidi

@@ -21,7 +21,22 @@ from my_mt3.model import MT3Mini
 from my_mt3.tokenizer import VOCAB, INPUT_FRAMES, build_vocab
 from my_mt3.audio import ensure_wave_cache, load_audio_mono
 from my_mt3.dataset import LogMelCfg, LogMelExtractor
-from my_mt3.infer import to_midi_from_tokens_piano
+from my_mt3.infer import to_midi_from_tokens_piano, ChunkDecodeResult, greedy_decode_batch, greedy_decode_batch_with_logprobs
+from my_mt3.eval import evaluate_midi_pair
+
+
+def collect_pairs_maps_csv(
+    maps_csv: str | Path,
+    split: str = "validation",
+    *,
+    program_id: int = 0,
+) -> List[Tuple[str, ...]]:
+    """MAPS_*_scenario.csv から指定 split の (audio_path, midi_path, program_id) を収集する。"""
+    df = pd.read_csv(maps_csv)
+    out: List[Tuple[str, ...]] = []
+    for _, row in df[df["split"] == split].iterrows():
+        out.append((str(row["audio_path"]), str(row["midi_path"]), int(program_id)))
+    return out
 
 
 def collect_pairs_maestro(
@@ -83,38 +98,6 @@ def shift_and_merge_pm(out_pm: pretty_midi.PrettyMIDI, pm_chunk: pretty_midi.Pre
     # 並べ替えは最後に一括で実施（性能最適化）
 
 
-def _greedy_decode_batch(model, mels_bt: torch.Tensor, *, max_len: int, device: str, program_id: int, vocab):
-    """
-    バッチ版greedy decode
-    - mels_bt: [B, T, F]
-    - 返り値: List[List[int]]（各サンプルのトークン列）
-    """
-    B = mels_bt.size(0)
-    mem = model.enc(mels_bt)  # [B, T', C] など
-    prg_key = f"PRG_{int(program_id)}"
-    bos_id = int(vocab.program.get(prg_key, int(min(vocab.program.values()))))
-    eos_id = int(vocab.eos)
-
-    y = torch.full((B, 1), bos_id, dtype=torch.long, device=device)  # [B,1]
-    finished = torch.zeros((B,), dtype=torch.bool, device=device)
-    outputs = [[] for _ in range(B)]
-
-    for _ in range(int(max_len)):
-        logits = model.dec(y, mem)[:, -1, :]           # [B, V]
-        nxt = torch.argmax(logits, dim=-1)             # [B]
-        for b in range(B):
-            if not finished[b]:
-                tok = int(nxt[b].item())
-                outputs[b].append(tok)
-                if tok == eos_id:
-                    finished[b] = True
-        if bool(torch.all(finished).item()):
-            break
-        y = torch.cat([y, nxt.unsqueeze(1)], dim=1)    # [B, L+1]
-
-    return outputs
-
-
 @torch.no_grad()
 def infer_one_song_piano(
     model,
@@ -129,11 +112,17 @@ def infer_one_song_piano(
     step_ms: int = 10,
     program_id: int = 0,
     max_len: int = 1024,
-    stride_frames: Optional[int] = None,   # スライド間隔（Noneなら input_frames）
-    batch_size: int = 16,                 # チャンクのデコードをこのバッチで並列
-) -> pretty_midi.PrettyMIDI:
+    stride_frames: Optional[int] = None,
+    batch_size: int = 16,
+    return_confidence: bool = False,
+):
+    """
+    Returns:
+      return_confidence=False: PrettyMIDI
+      return_confidence=True:  (PrettyMIDI, List[dict])
+        dict keys: chunk_idx, t0, t1, n_tokens, log_pyx, log_pyx_norm
+    """
     model.eval()
-    # 速度最適化フラグ
     if torch.cuda.is_available():
         torch.backends.cudnn.benchmark = True
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -147,8 +136,6 @@ def infer_one_song_piano(
     feat = LogMelExtractor(LogMelCfg(sr=sr, n_fft=n_fft, hop=hop, n_mels=n_mels))
     need_samples = (int(input_frames) - 1) * int(hop) + int(n_fft)
     window_sec = need_samples / float(sr)
-    frame_max_template = int(round(window_sec * 1000.0 / float(step_ms)))
-    frame_max_token = max(0, frame_max_template - 1)
     if stride_frames is None:
         stride_frames = input_frames
     stride_samples = int(stride_frames) * int(hop)
@@ -159,7 +146,24 @@ def infer_one_song_piano(
     if starts[-1] != last_start:
         starts.append(last_start)
     out_pm = pretty_midi.PrettyMIDI()
-    # 1) すべてのチャンクmelを作成
+    conf_rows: List[dict] = []
+    # carry-over: pitch -> absolute onset (sec).  前チャンクから持ち越し中のノート
+    carry: dict[int, float] = {}
+    _vel = 80
+    _default_dur_sec = 0.05
+
+    def _add_carry_note(pitch: int, onset_sec: float, offset_sec: float) -> None:
+        if offset_sec <= onset_sec:
+            offset_sec = onset_sec + _default_dur_sec
+        if not out_pm.instruments:
+            out_pm.instruments.append(
+                pretty_midi.Instrument(program=int(program_id))
+            )
+        out_pm.instruments[0].notes.append(
+            pretty_midi.Note(velocity=_vel, pitch=pitch,
+                             start=onset_sec, end=offset_sec)
+        )
+
     mel_list: List[np.ndarray] = []
     for ss in starts:
         ee = ss + need_samples
@@ -175,34 +179,94 @@ def infer_one_song_piano(
                 mel = np.pad(mel, ((0, padT), (0, 0)), mode="constant")
         mel_list.append(mel.astype(np.float32, copy=False))
 
-    # 2) バッチでdecode
     for b0 in range(0, len(starts), max(1, int(batch_size))):
         b1 = min(len(starts), b0 + int(batch_size))
         mels_bt = torch.from_numpy(np.stack(mel_list[b0:b1], axis=0)).to(device=device, dtype=torch.float32)
-        # autocastで高速化（GPU時）
-        if torch.cuda.is_available():
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                token_batch = _greedy_decode_batch(
-                    model, mels_bt, max_len=max_len, device=device, program_id=int(program_id), vocab=vocab
+
+        use_autocast = torch.cuda.is_available()
+
+        if return_confidence:
+            if use_autocast:
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    token_batch, lp_batch = greedy_decode_batch_with_logprobs(
+                        model, mels_bt, max_len=max_len, device=device,
+                        program_id=int(program_id), vocab=vocab,
+                    )
+            else:
+                token_batch, lp_batch = greedy_decode_batch_with_logprobs(
+                    model, mels_bt, max_len=max_len, device=device,
+                    program_id=int(program_id), vocab=vocab,
                 )
         else:
-            token_batch = _greedy_decode_batch(
-                model, mels_bt, max_len=max_len, device=device, program_id=int(program_id), vocab=vocab
-            )
-        # 3) MIDI化して結合
+            if use_autocast:
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    token_batch = greedy_decode_batch(
+                        model, mels_bt, max_len=max_len, device=device,
+                        program_id=int(program_id), vocab=vocab,
+                    )
+            else:
+                token_batch = greedy_decode_batch(
+                    model, mels_bt, max_len=max_len, device=device,
+                    program_id=int(program_id), vocab=vocab,
+                )
+            lp_batch = None
+
         for local_i, token_ids in enumerate(token_batch):
-            ss = starts[b0 + local_i]
-            pm_chunk = to_midi_from_tokens_piano(
+            chunk_idx = b0 + local_i
+            ss = starts[chunk_idx]
+            res: ChunkDecodeResult = to_midi_from_tokens_piano(
                 token_ids,
                 program_id=int(program_id),
                 step_ms=int(step_ms),
                 vocab=vocab,
             )
             s_sec = ss / float(sr)
-            shift_and_merge_pm(out_pm, pm_chunk, t0=float(s_sec))
-    # 最後に整列
+
+            # --- carry-over 解決 ---
+            for p in list(carry.keys()):
+                if p in res.tie_pitches:
+                    if p in res.tie_offsets_ms:
+                        # tie 宣言あり & offset 確定 → ノート完成
+                        _add_carry_note(p, carry.pop(p),
+                                        s_sec + res.tie_offsets_ms[p] / 1000.0)
+                    # else: tie 宣言あり & offset 未確定 → まだ鳴り続ける (carry 維持)
+                else:
+                    # tie 宣言なし → チャンク境界で強制終了
+                    _add_carry_note(p, carry.pop(p), s_sec)
+
+            # --- チャンク内の通常ノートをマージ ---
+            shift_and_merge_pm(out_pm, res.pm, t0=float(s_sec))
+
+            # --- open notes → carry に追加 ---
+            for p, on_ms in res.open_onsets_ms.items():
+                if p not in carry:
+                    carry[p] = s_sec + on_ms / 1000.0
+
+            if return_confidence and lp_batch is not None:
+                lps = lp_batch[local_i]
+                n_tok = len(lps)
+                log_pyx = sum(lps) if n_tok > 0 else 0.0
+                conf_rows.append({
+                    "chunk_idx": chunk_idx,
+                    "t0": s_sec,
+                    "t1": s_sec + window_sec,
+                    "n_tokens": n_tok,
+                    "log_pyx": log_pyx,
+                    "log_pyx_norm": (log_pyx / n_tok) if n_tok > 0 else 0.0,
+                })
+
+    # --- 最終チャンク後に残った carry を閉じる ---
+    if carry:
+        last_sec = starts[-1] / float(sr) + window_sec
+        for p, onset_sec in carry.items():
+            _add_carry_note(p, onset_sec, last_sec)
+        carry.clear()
+
     for inst in out_pm.instruments:
         inst.notes.sort(key=lambda n: (n.start, n.pitch))
+
+    if return_confidence:
+        return out_pm, conf_rows
     return out_pm
 
 
@@ -212,10 +276,15 @@ def main():
     ap.add_argument(
         "--root",
         type=str,
-        required=True,
+        default=None,
         help="MAESTRO v3.0.0 root (contains maestro-v3.0.0.csv and year dirs)",
     )
     ap.add_argument("--split", type=str, default="validation", choices=["train", "validation", "test"])
+    ap.add_argument("--maps_csv", type=str, default=None,
+                     help="MAPS_*_scenario.csv (overrides --root)")
+    ap.add_argument("--maps_split", type=str, default="validation",
+                     choices=["train", "validation"],
+                     help="split to use from --maps_csv (default: validation)")
     # 単体ファイル推論用
     ap.add_argument("--wav", type=str, help="入力WAVファイル（単体推論）")
     ap.add_argument("--out", type=str, help="出力MIDIパス（--wav 指定時）")
@@ -236,6 +305,14 @@ def main():
     ap.add_argument("--prefetch_cache_workers", type=int, default=0, help="parallelize wave cache creation")
     ap.add_argument("--cpu_threads", type=int, default=4, help="limit PyTorch CPU threads (0=leave default)")
     ap.add_argument("--cpu_interop_threads", type=int, default=1, help="limit PyTorch interop threads (0=auto)")
+    # evaluation
+    ap.add_argument("--eval", action="store_true", help="evaluate against ground-truth MIDI after inference")
+    ap.add_argument("--onset_tolerance", type=float, default=0.05, help="onset tolerance in seconds")
+    ap.add_argument("--offset_ratio", type=float, default=0.2, help="offset ratio (None to use fixed tolerance)")
+    ap.add_argument("--offset_min_tolerance", type=float, default=0.05, help="minimum offset tolerance in seconds")
+    ap.add_argument("--max_songs", type=int, default=0, help="limit number of songs to process (0=all)")
+    ap.add_argument("--save_confidence", action="store_true",
+                     help="save per-chunk confidence (log_pyx) to chunk_confidence.csv")
     args = ap.parse_args()
 
     # ---- limit CPU thread usage to avoid CPU hog ----
@@ -297,7 +374,13 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # collect pairs
-    pairs = collect_pairs_maestro(args.root, split=args.split, program_id=args.program_id)
+    if args.maps_csv is not None:
+        pairs = collect_pairs_maps_csv(args.maps_csv, split=args.maps_split, program_id=args.program_id)
+        print(f"[MAPS] {args.maps_csv}  split={args.maps_split}  pairs={len(pairs)}")
+    else:
+        if args.root is None:
+            raise SystemExit("Either --root or --maps_csv must be specified.")
+        pairs = collect_pairs_maestro(args.root, split=args.split, program_id=args.program_id)
     if len(pairs) == 0:
         raise RuntimeError("No pairs found. Check root/csv paths.")
     if args.num_shards <= 0:
@@ -305,7 +388,10 @@ def main():
     if not (0 <= args.shard_id < args.num_shards):
         raise SystemExit(f"--shard_id must be in [0,{args.num_shards-1}]")
     pairs = [pairs[i] for i in range(args.shard_id, len(pairs), args.num_shards)]
-    print(f"pairs[{args.split}] shard {args.shard_id}/{args.num_shards}: {len(pairs)}")
+    if args.max_songs > 0:
+        pairs = pairs[:args.max_songs]
+    split_label = args.maps_split if args.maps_csv else args.split
+    print(f"pairs[{split_label}] shard {args.shard_id}/{args.num_shards}: {len(pairs)}")
 
     # optional: precreate wave cache in parallel (CPU-bound IO)
     if args.use_cache and args.prefetch_cache_workers > 0:
@@ -317,7 +403,10 @@ def main():
         with futures.ThreadPoolExecutor(max_workers=int(args.prefetch_cache_workers)) as ex:
             list(tqdm(ex.map(_cache_one, pairs), total=len(pairs), desc="prefetch cache", unit="file"))
 
-    for audio_path, midi_path, pid in tqdm(pairs, desc=f"infer {args.split}", unit="song"):
+    eval_rows = []
+    conf_all_rows = []
+
+    for audio_path, midi_path, pid in tqdm(pairs, desc=f"infer {split_label}", unit="song"):
         a_path = audio_path
         if args.use_cache and not str(audio_path).endswith(".npy"):
             a_path = ensure_wave_cache(audio_path, cache_dir=args.cache_dir, sr=args.sr)
@@ -325,7 +414,7 @@ def main():
         stem = Path(audio_path).stem
         out_mid = out_dir / f"{stem}.pred.mid"
 
-        pm_pred = infer_one_song_piano(
+        result = infer_one_song_piano(
             model,
             a_path,
             device=args.device,
@@ -338,10 +427,52 @@ def main():
             program_id=pid,
             batch_size=args.batch_size,
             stride_frames=args.stride_frames,
+            return_confidence=args.save_confidence,
         )
+        if args.save_confidence:
+            pm_pred, chunk_confs = result
+            for row in chunk_confs:
+                row["stem"] = stem
+            conf_all_rows.extend(chunk_confs)
+        else:
+            pm_pred = result
+
         pm_pred.write(str(out_mid))
 
+        if args.eval:
+            try:
+                m = evaluate_midi_pair(
+                    midi_path, str(out_mid),
+                    onset_tolerance=args.onset_tolerance,
+                    offset_ratio=args.offset_ratio,
+                    offset_min_tolerance=args.offset_min_tolerance,
+                    program=pid,
+                )
+                m["stem"] = stem
+                eval_rows.append(m)
+            except Exception as e:
+                print(f"[eval skip] {stem}: {e}")
+
     print(f"done -> {out_dir}")
+
+    if args.save_confidence and conf_all_rows:
+        df_conf = pd.DataFrame(conf_all_rows)
+        conf_csv = out_dir / "chunk_confidence.csv"
+        df_conf.to_csv(conf_csv, index=False)
+        print(f"confidence CSV -> {conf_csv}  ({len(df_conf)} chunks)")
+
+    if args.eval and eval_rows:
+        df_eval = pd.DataFrame(eval_rows)
+        csv_path = out_dir / "eval_metrics.csv"
+        df_eval.to_csv(csv_path, index=False)
+        print(f"eval CSV -> {csv_path}")
+
+        metric_cols = [c for c in df_eval.columns if c != "stem"]
+        summary = df_eval[metric_cols].mean()
+        print("\n=== Evaluation Summary ===")
+        for k, v in summary.items():
+            print(f"  {k}: {v:.4f}")
+        print()
 
 
 if __name__ == "__main__":

@@ -1,0 +1,9 @@
+torch
+torchaudio
+librosa
+soundfile
+numpy
+tqdm
+pretty_midi
+mir_eval
+pyyaml

@@ -30,6 +30,7 @@ from my_mt3.tokenizer import build_vocab, INPUT_FRAMES
 from my_mt3.audio import ensure_wave_cache
 import concurrent.futures as futures
 import csv
+import json
 
 # torchaudio / numpy 由来の冗長な UserWarning を抑制（任意）
 warnings.filterwarnings("ignore", category=UserWarning, module="torchaudio")
@@ -99,8 +100,12 @@ if __name__ == "__main__":
     ap.add_argument("--ema_decay", type=float, default=0.999)
     ap.add_argument("--unsup_weight", type=float, default=1.0)
     ap.add_argument("--pseudo_max_len", type=int, default=1024)
-    ap.add_argument("--top_frac", type=float, default=0.2)
-    ap.add_argument("--bot_frac", type=float, default=0.2)
+    ap.add_argument("--pseudo_threshold", type=float, default=-0.5,
+                     help="chunk-level mean log-prob threshold for pseudo-label (lower = accept more, used when pseudo_topn=0)")
+    ap.add_argument("--pseudo_topn", type=int, default=0,
+                     help="select top-N most confident chunks per batch as pseudo-labels (0=use threshold mode)")
+    ap.add_argument("--pretrained_ckpt", type=str, default=None,
+                     help="path to a pretrained MT3 checkpoint (.pt) to initialise model weights")
     ap.add_argument("--real_wav_dir", type=str, default="dataset/maestro-v3.0.0", help="real (unlabeled) WAV directory for DA (recursive, e.g., MAESTRO root)")
     ap.add_argument("--save-every", type=int, default=10)
     ap.add_argument("--save-dir", type=str, default=None, help="未指定なら checkpoints_maestro/run_YYYYmmdd_HHMMSS")
@@ -134,6 +139,21 @@ if __name__ == "__main__":
     print(f"[synth] train={len(pairs['train'])} | val(skipped)={len(pairs['validation'])}")
     print(f"📁 Checkpoints will be saved to: {save_dir}")
 
+    # ===== Save meta.json =====
+    meta = {
+        "script": "train_maestro_ddp_DA.py",
+        "timestamp": datetime.now().isoformat(),
+        "args": vars(args),
+        "data": {
+            "synth_train": len(pairs["train"]),
+            "synth_val": len(pairs["validation"]),
+        },
+    }
+    meta_path = os.path.join(save_dir, "meta.json")
+    with open(meta_path, "w") as f:
+        json.dump(meta, f, indent=2, ensure_ascii=False)
+    print(f"Meta saved -> {meta_path}")
+
     # ===== Vocab をここで固定生成 =====
     # MAESTRO（ピアノ）前提: piano / Note Off あり / tie あり（既定）
     vocab = build_vocab(input_frames=INPUT_FRAMES, instrument_type="piano", include_note_off=True)
@@ -147,6 +167,11 @@ if __name__ == "__main__":
     if len(real_wavs) == 0:
         raise SystemExit(f"No wav files found under: {real_root}")
     pairs_real = {"train": real_wavs}
+
+    # real_wavs 数をメタに追記
+    meta["data"]["real_wavs"] = len(real_wavs)
+    with open(meta_path, "w") as f:
+        json.dump(meta, f, indent=2, ensure_ascii=False)
 
     # ---- cache ディレクトリをデータセット名で自動振り分け ----
     def _dataset_name_from(path_str: str) -> str:
@@ -236,8 +261,9 @@ if __name__ == "__main__":
             ema_decay=args.ema_decay,
             unsup_weight=args.unsup_weight,
             pseudo_max_len=args.pseudo_max_len,
-            top_frac=args.top_frac,
-            bot_frac=args.bot_frac,
+            pseudo_threshold=args.pseudo_threshold,
+            pseudo_topn=args.pseudo_topn,
+            pretrained_ckpt=args.pretrained_ckpt,
             epochs=args.epochs,
             bs=args.bs,
             save_every=args.save_every,
@@ -251,7 +277,6 @@ if __name__ == "__main__":
         model = train_loop_distributed_DA_confusion(
             pairs,
             vocab=vocab,
-            # discriminator_mode=args.discriminator_mode,
             pairs_real=pairs_real,
             lambda_adv=args.lambda_adv,
             lr_t=args.lr_t,
@@ -263,8 +288,9 @@ if __name__ == "__main__":
             ema_decay=args.ema_decay,
             unsup_weight=args.unsup_weight,
             pseudo_max_len=args.pseudo_max_len,
-            top_frac=args.top_frac,
-            bot_frac=args.bot_frac,
+            pseudo_threshold=args.pseudo_threshold,
+            pseudo_topn=args.pseudo_topn,
+            pretrained_ckpt=args.pretrained_ckpt,
             epochs=args.epochs,
             bs=args.bs,
             save_every=args.save_every,

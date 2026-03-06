@@ -216,20 +216,15 @@ class FastDecoderKV(nn.Module):
         eos_id: Optional[int] = None,
         pad_id: Optional[int] = None,
         return_with_prefix: bool = True,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         KV-cache greedy decode + confidence outputs.
 
         Returns:
-          y:     [B, S] tokens. If return_with_prefix=True then includes y0 prefix.
-                 If return_with_prefix=False then returns only generated part (prefix removed).
-          pmax:  [B, S_gen] per generated token max-softmax probability (aligned to generated tokens only)
-          margin:[B, S_gen] per generated token (top1 - top2) (aligned to generated tokens only)
-
-        Notes:
-          - pmax/margin are defined only for NEW tokens (the ones generated after y0).
-          - if eos_id provided, per-sample early-stop; after EOS, tokens are filled with pad_id (if given)
-            else keep emitting eos_id for shape stability.
+          y:        [B, S] tokens.
+          pmax:     [B, S_gen] per generated token max-softmax probability
+          margin:   [B, S_gen] per generated token (top1 - top2)
+          log_prob: [B, S_gen] per generated token log P(chosen token)
         """
         self.eval()
         B = y0.size(0)
@@ -266,48 +261,48 @@ class FastDecoderKV(nn.Module):
         # Collect confidences for generated tokens only
         pmax_list: List[torch.Tensor] = []
         margin_list: List[torch.Tensor] = []
+        logprob_list: List[torch.Tensor] = []
 
         for _ in range(int(max_new_tokens)):
             logits = self.forward_step(cur, cache)               # [B,V]
             probs = F.softmax(logits, dim=-1)                    # [B,V]
+            log_p = F.log_softmax(logits, dim=-1)                # [B,V]
             top2 = torch.topk(probs, k=2, dim=-1).values         # [B,2]
             p1 = top2[:, 0]                                      # [B]
             p2 = top2[:, 1]                                      # [B]
             m = p1 - p2
 
             nxt = torch.argmax(logits, dim=-1, keepdim=True)     # [B,1]
+            chosen_logp = log_p.gather(1, nxt).squeeze(1)         # [B]
 
             if eos_id is not None:
-                # if already finished, fill pad_id; else keep predicted
                 nxt = torch.where(finished[:, None], torch.full_like(nxt, int(pad_id)), nxt)
-                # update finished based on *predicted* token before padding (use nxt after where is also OK if pad_id != eos)
                 newly_finished = (nxt.squeeze(1) == int(eos_id)) & (~finished)
                 finished = finished | newly_finished
 
-            # store token
             out_tokens.append(nxt)
 
-            # store conf: for finished samples, conf=0
             pmax_list.append(torch.where(finished, torch.zeros_like(p1), p1))
             margin_list.append(torch.where(finished, torch.zeros_like(m), m))
+            logprob_list.append(torch.where(finished, torch.zeros_like(chosen_logp), chosen_logp))
 
             cur = nxt
 
             if eos_id is not None and bool(finished.all()):
                 break
 
-        # concat tokens
         y = torch.cat(out_tokens, dim=1) if out_tokens else torch.empty((B, 0), dtype=torch.long, device=device)
 
-        # concat probs (generated part only)
         if pmax_list:
-            pmax = torch.stack(pmax_list, dim=1)    # [B, S_gen]
+            pmax = torch.stack(pmax_list, dim=1)       # [B, S_gen]
             margin = torch.stack(margin_list, dim=1)
+            log_prob = torch.stack(logprob_list, dim=1) # [B, S_gen]
         else:
             pmax = torch.empty((B, 0), dtype=torch.float32, device=device)
             margin = torch.empty((B, 0), dtype=torch.float32, device=device)
+            log_prob = torch.empty((B, 0), dtype=torch.float32, device=device)
 
-        return y, pmax, margin
+        return y, pmax, margin, log_prob
 
 
 # ----------------------------
@@ -323,38 +318,34 @@ def pseudo_label_with_kvcache(
     vocab,
     max_new_tokens: int,
     return_with_prefix: bool = False,  # False => PRGを除いた生成列を返す（推奨）
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Generates pseudo labels using EMA teacher encoder + KV-cache decoder reusing teacher.dec weights.
 
     Returns:
-      out:    [B,S] token ids (PRG prefix excluded if return_with_prefix=False; else included)
-      pmax:   [B,S_gen] confidence for generated tokens (aligned to generated tokens only)
-      margin: [B,S_gen]
+      out:      [B,S] token ids (PRG prefix excluded if return_with_prefix=False; else included)
+      pmax:     [B,S_gen] per-token max softmax probability
+      margin:   [B,S_gen] per-token (top1 - top2)
+      log_prob: [B,S_gen] per-token log P(chosen token)
     """
     teacher.eval()
     fast_dec.eval()
 
-    # encoder once
     mem = teacher.enc(mel)
 
-    # PRG token is your BOS
-    prg_id = int(vocab.program[f"PRG_{int(program_id)}"])
-    y0 = torch.full((mel.size(0), 1), prg_id, dtype=torch.long, device=mel.device)  # [B,1]
+    prg_id = int(vocab.instrument_type[f"PRG_{int(program_id)}"])
+    y0 = torch.full((mel.size(0), 1), prg_id, dtype=torch.long, device=mel.device)
 
-    # generate with probs (prefix included in y if return_with_prefix=True)
-    y, pmax, margin = fast_dec.greedy_generate_with_probs(
+    y, pmax, margin, log_prob = fast_dec.greedy_generate_with_probs(
         mem,
         y0=y0,
         max_new_tokens=max_new_tokens,
         eos_id=int(vocab.eos),
         pad_id=int(vocab.pad),
-        return_with_prefix=True,          # always generate with prefix, then slice if needed
+        return_with_prefix=True,
     )
 
     if return_with_prefix:
-        # y includes PRG in front: [B, 1+S_gen]
-        return y, pmax, margin
+        return y, pmax, margin, log_prob
     else:
-        # remove PRG prefix; keep only generated tokens
-        return y[:, 1:], pmax, margin
+        return y[:, 1:], pmax, margin, log_prob

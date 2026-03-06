@@ -9,12 +9,62 @@ import numpy as np
 import torch
 import torchaudio
 import pretty_midi
+import mido
 from torch.utils.data import Dataset
 from my_mt3.audio import load_audio_mono, LogMelExtractor, LogMelCfg
 from my_mt3.tokenizer import encode_events, INPUT_FRAMES, Vocab
 import random
 
 DEFAULT_SR = 16000
+
+
+def _load_notes_mido(midi_path: str):
+    """Fallback MIDI loader using mido.
+
+    Used when pretty_midi rejects the file due to large tick counts
+    (e.g. MAPS dataset uses ticks_per_beat=32767).
+    """
+    mid = mido.MidiFile(midi_path)
+    tpb = mid.ticks_per_beat
+
+    tempo_events: list[tuple[int, int]] = []
+    for track in mid.tracks:
+        abs_tick = 0
+        for msg in track:
+            abs_tick += msg.time
+            if msg.type == "set_tempo":
+                tempo_events.append((abs_tick, msg.tempo))
+    tempo_events.sort()
+    if not tempo_events or tempo_events[0][0] > 0:
+        tempo_events.insert(0, (0, 500000))
+
+    def tick2sec(tick: int) -> float:
+        sec = 0.0
+        prev_tick, prev_tempo = 0, 500000
+        for t, tmp in tempo_events:
+            if t >= tick:
+                break
+            sec += mido.tick2second(t - prev_tick, tpb, prev_tempo)
+            prev_tick, prev_tempo = t, tmp
+        sec += mido.tick2second(tick - prev_tick, tpb, prev_tempo)
+        return sec
+
+    notes = []
+    for track in mid.tracks:
+        abs_tick = 0
+        active: dict[int, int] = {}
+        for msg in track:
+            abs_tick += msg.time
+            if msg.type == "note_on" and msg.velocity > 0:
+                active[msg.note] = abs_tick
+            elif msg.type == "note_off" or (msg.type == "note_on" and msg.velocity == 0):
+                if msg.note in active:
+                    start = tick2sec(active.pop(msg.note))
+                    end = tick2sec(abs_tick)
+                    notes.append((start, end, msg.note))
+    return notes
+
+
 # -------------------------
 # Dataset (chunk enumeration)
 # -------------------------
@@ -102,8 +152,11 @@ class AMTDataset(Dataset):
     def _load_notes(self, midi_path: str):
         if midi_path in self._midi_cache:
             return self._midi_cache[midi_path]
-        pm = pretty_midi.PrettyMIDI(midi_path)
-        notes = [(n.start, n.end, n.pitch) for inst in pm.instruments for n in inst.notes]
+        try:
+            pm = pretty_midi.PrettyMIDI(midi_path)
+            notes = [(n.start, n.end, n.pitch) for inst in pm.instruments for n in inst.notes]
+        except ValueError:
+            notes = _load_notes_mido(midi_path)
         self._midi_cache[midi_path] = notes
         return notes
 

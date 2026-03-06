@@ -39,9 +39,10 @@ class SinusoidalPositionalEncoding(nn.Module):
 
 class TransformerConfidenceClf(nn.Module):
     """
-    Transformer Encoder + [CLS] binary classifier.
+    Transformer Encoder + [CLS] binary classifier + optional MLM head.
     Input: token ids (B, L) with [CLS] at position 0.
-    Output: logits (B,) where sigmoid(logits) = confidence score in [0,1].
+    Output (forward):     logits (B,)  — sigmoid(logits) = confidence in [0,1].
+    Output (forward_mlm): logits (B, L, vocab_size) — per-position vocab prediction.
     """
     def __init__(self, cfg: ConfClfCfg):
         super().__init__()
@@ -62,44 +63,55 @@ class TransformerConfidenceClf(nn.Module):
         self.encoder = nn.TransformerEncoder(enc_layer, num_layers=cfg.n_layers)
         self.dropout = nn.Dropout(cfg.dropout)
 
+        # [CLS] binary classification head
         self.head = nn.Sequential(
             nn.LayerNorm(cfg.d_model),
             nn.Linear(cfg.d_model, 1),
         )
 
+        # MLM head: predict original token at each masked position
+        self.mlm_head = nn.Sequential(
+            nn.LayerNorm(cfg.d_model),
+            nn.Linear(cfg.d_model, cfg.d_model),
+            nn.GELU(),
+            nn.Linear(cfg.d_model, cfg.vocab_size),
+        )
+
         self._init_parameters()
 
     def _init_parameters(self):
-        # Mildly bias towards "low confidence" at init (optional).
-        # You can comment this out.
         with torch.no_grad():
             self.head[-1].bias.fill_(-1.0)
 
-    def forward(self, tokens: torch.Tensor, attn_mask: torch.Tensor | None = None) -> torch.Tensor:
-        """
-        tokens: (B, L) int64
-        attn_mask: (B, L) bool where True = keep, False = pad (optional)
-        returns logits: (B,)
-        """
+    def encode(
+        self, tokens: torch.Tensor, attn_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Shared encoder: tokens (B,L) -> hidden (B,L,D)."""
         assert tokens.dim() == 2
         B, L = tokens.shape
         assert L <= self.cfg.max_len, f"input length {L} exceeds max_len {self.cfg.max_len}"
 
-        x = self.tok_emb(tokens)  # (B,L,D)
+        x = self.tok_emb(tokens)
         x = self.pos_enc(x)
         x = self.dropout(x)
 
-        # PyTorch TransformerEncoder uses src_key_padding_mask with True=PAD to ignore
         if attn_mask is None:
-            # pad positions are tokens == pad_id
-            src_key_padding_mask = (tokens == self.cfg.pad_id)  # (B,L)
+            src_key_padding_mask = (tokens == self.cfg.pad_id)
         else:
-            src_key_padding_mask = ~attn_mask  # invert: True = pad
+            src_key_padding_mask = ~attn_mask
 
-        h = self.encoder(x, src_key_padding_mask=src_key_padding_mask)  # (B,L,D)
-        cls_h = h[:, 0, :]  # [CLS]
-        logits = self.head(cls_h).squeeze(-1)  # (B,)
-        return logits
+        return self.encoder(x, src_key_padding_mask=src_key_padding_mask)
+
+    def forward(self, tokens: torch.Tensor, attn_mask: torch.Tensor | None = None) -> torch.Tensor:
+        """Binary classification: returns logits (B,)."""
+        h = self.encode(tokens, attn_mask)
+        cls_h = h[:, 0, :]
+        return self.head(cls_h).squeeze(-1)
+
+    def forward_mlm(self, tokens: torch.Tensor, attn_mask: torch.Tensor | None = None) -> torch.Tensor:
+        """MLM: returns per-position logits (B, L, vocab_size)."""
+        h = self.encode(tokens, attn_mask)
+        return self.mlm_head(h)
 
     @torch.no_grad()
     def score(self, tokens: torch.Tensor, attn_mask: torch.Tensor | None = None) -> torch.Tensor:

@@ -30,4 +30,4 @@ class AMTRealDataset(Dataset):
         mel = self.feat(y_seg)  # [input_frames, n_mels]
         if mel.shape[0] != self.input_frames:
             mel = mel[: self.input_frames] if mel.shape[0] > self.input_frames else np.pad(mel, ((0,self.input_frames-mel.shape[0]),(0,0)))
-        return torch.tensor(mel, dtype=torch.float32)
+        return torch.tensor(mel, dtype=torch.float32), i, ss

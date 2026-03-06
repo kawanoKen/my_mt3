@@ -18,8 +18,9 @@ from torch.utils.data.distributed import DistributedSampler
 
 def setup():
     # torchrunが設定する環境変数から自動で初期化
-    dist.init_process_group(backend="nccl") # GPUならnccl, CPUならgloo
-    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group(backend="nccl", device_id=torch.device(f"cuda:{local_rank}"))
 
 
 def _maybe_cache_pairs_list(pairs_list, *, sr: int, cache_dir: str | None):
@@ -211,7 +212,7 @@ def train_loop_distributed(
     device = torch.device(f"cuda:{local_rank}")
 
     if not dist.is_initialized():
-        dist.init_process_group(backend="nccl")
+        dist.init_process_group(backend="nccl", device_id=device)
 
     rank = dist.get_rank()
     world = dist.get_world_size()
@@ -283,6 +284,10 @@ def train_loop_distributed(
 
     if rank == 0:
         print(f"[DDP] world={world} | train songs={len(train_ds)} | val songs={len(val_ds)}")
+        import csv as _csv
+        with open(os.path.join(save_dir, "losses.csv"), "w", newline="") as f:
+            w = _csv.writer(f)
+            w.writerow(["epoch", "train_loss", "val_loss"])
 
     # 5) loop
     for ep in range(epochs):
@@ -307,22 +312,25 @@ def train_loop_distributed(
             if rank == 0:
                 pbar.set_postfix(train_loss=f"{loss.item():.3f}")
 
-        # ---- val: 全rankで実行して平均 ----
-        val_loss = 0
-        if ep+1 == save_every:
+        # ---- val ----
+        val_loss = 0.0
+        if (ep + 1) % 10 == 0 or (ep + 1) == epochs:
             val_loss = eval_loop_ddp(model, val_dl, crit, device)
 
         if rank == 0:
             avg_train = running / max(1, len(train_dl))
             print(f"[epoch {ep+1}] train_loss={avg_train:.3f} | val_loss={val_loss:.3f}")
 
+            import csv as _csv
+            with open(os.path.join(save_dir, "losses.csv"), "a", newline="") as f:
+                w = _csv.writer(f)
+                w.writerow([ep+1, f"{avg_train:.6f}", f"{val_loss:.6f}"])
+
             if (ep + 1) % save_every == 0 or (ep + 1) == epochs:
                 save_path = os.path.join(save_dir, f"model_ep{ep+1}.pt")
-                # ★moduleなしで保存
                 torch.save(model.module.state_dict(), save_path)
-                print(f"✅ saved -> {save_path}")
+                print(f"saved -> {save_path}")
 
-        # 任意：全rank同期（デバッグ向け）
         dist.barrier()
 
     dist.destroy_process_group()

@@ -172,7 +172,7 @@ if __name__ == "__main__":
                           "supervised-only, no pseudo-label)")
     ap.add_argument("--epochs", type=int, default=5000)
     ap.add_argument("--bs", type=int, default=4)
-    ap.add_argument("--lr_t", type=float, default=5e-4, help="Transformer lr")
+    ap.add_argument("--lr_t", type=float, default=2e-4, help="Transformer lr")
     ap.add_argument("--input_frames", type=int, default=256,
                      help="segment length in frames (hop=256, sr=16k: 121 ~ 2.048s)")
     ap.add_argument("--lr_warmup_epochs", type=int, default=100,
@@ -181,7 +181,7 @@ if __name__ == "__main__":
                      help="minimum LR ratio for cosine decay scheduler")
 
     # Pseudo-label (SSL)
-    ap.add_argument("--pseudo_start_epoch", type=int, default=50000,
+    ap.add_argument("--pseudo_start_epoch", type=int, default=10000,
                      help="start pseudo-label training from this epoch")
     ap.add_argument("--ema_decay", type=float, default=0.999)
     ap.add_argument("--unsup_weight", type=float, default=1.0,
@@ -377,7 +377,7 @@ if __name__ == "__main__":
         use_cache=False,
         cache_dir=args.cache_root,
         sr=args.sr,
-        num_workers=4,
+        num_workers=2,
     )
 
     # Plot losses

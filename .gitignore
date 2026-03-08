@@ -38,6 +38,7 @@ outputs/
 YourMT3
 
 ckpt_conf_midi/
+checkpoints*/
 
 ckpt_conf_mlm/
 onset_and_frames/runs/

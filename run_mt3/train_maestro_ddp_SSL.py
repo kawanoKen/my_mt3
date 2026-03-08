@@ -156,6 +156,40 @@ def load_maps_csv(
     return {"train": train_pairs, "validation": val_pairs}, [], []
 
 
+def load_maestro_unlabeled(
+    root: str | Path,
+    *,
+    require_exists: bool = True,
+) -> Tuple[List[str], List[str]]:
+    """
+    MAESTRO train split を unlabeled 用に読み込む。
+    Returns:
+      unlabeled_wavs: List[str]
+      unlabeled_midis: List[str]  # oracle_filter 用
+    """
+    root = Path(root)
+    csv_path = root / "maestro-v3.0.0.csv"
+    if not csv_path.exists():
+        raise FileNotFoundError(f"CSV not found: {csv_path}")
+
+    df = pd.read_csv(csv_path)
+    for col in ("split", "audio_filename", "midi_filename"):
+        if col not in df.columns:
+            raise ValueError(f"CSV column '{col}' not found in {csv_path}")
+
+    unlabeled_wavs: List[str] = []
+    unlabeled_midis: List[str] = []
+    for _, row in df[df["split"] == "train"].iterrows():
+        audio_path = root / str(row["audio_filename"])
+        midi_path = root / str(row["midi_filename"])
+        if require_exists and (not audio_path.exists() or not midi_path.exists()):
+            continue
+        unlabeled_wavs.append(str(audio_path))
+        unlabeled_midis.append(str(midi_path))
+
+    return unlabeled_wavs, unlabeled_midis
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Semi-supervised MAESTRO training (partial labels)")
     ap.add_argument("--root", type=str, default="dataset/maestro-v3.0.0",
@@ -170,6 +204,8 @@ if __name__ == "__main__":
     ap.add_argument("--maps_csv", type=str, default=None,
                      help="path to a MAPS_*_scenario.csv (overrides --root/--split_csv; "
                           "supervised-only, no pseudo-label)")
+    ap.add_argument("--maps_labeled_maestro_unlabeled", action="store_true",
+                     help="use MAPS (maps_csv) as labeled data and MAESTRO train (root) as unlabeled data")
     ap.add_argument("--epochs", type=int, default=5000)
     ap.add_argument("--bs", type=int, default=4)
     ap.add_argument("--lr_t", type=float, default=2e-4, help="Transformer lr")
@@ -181,7 +217,7 @@ if __name__ == "__main__":
                      help="minimum LR ratio for cosine decay scheduler")
 
     # Pseudo-label (SSL)
-    ap.add_argument("--pseudo_start_epoch", type=int, default=10000,
+    ap.add_argument("--pseudo_start_epoch", type=int, default=1000,
                      help="start pseudo-label training from this epoch")
     ap.add_argument("--ema_decay", type=float, default=0.999)
     ap.add_argument("--unsup_weight", type=float, default=1.0,
@@ -238,6 +274,9 @@ if __name__ == "__main__":
     if args.maps_csv is not None:
         print(f"[MAPS] Loading scenario CSV: {args.maps_csv}")
         pairs_labeled, unlabeled_wavs, unlabeled_midis = load_maps_csv(args.maps_csv, program_id=0)
+        if args.maps_labeled_maestro_unlabeled:
+            print(f"[MAPS+MAESTRO] Loading MAESTRO unlabeled from: {args.root}")
+            unlabeled_wavs, unlabeled_midis = load_maestro_unlabeled(args.root)
     elif args.split_csv is not None:
         print(f"[SSL] Loading split from CSV: {args.split_csv}")
         pairs_labeled, unlabeled_wavs, unlabeled_midis = load_split_from_csv(
@@ -257,7 +296,10 @@ if __name__ == "__main__":
     total_train = n_train_labeled + n_unlabeled
 
     if args.maps_csv is not None:
-        print(f"[MAPS] train={n_train_labeled} | val={n_val}")
+        if args.maps_labeled_maestro_unlabeled:
+            print(f"[MAPS+MAESTRO] labeled_train={n_train_labeled} | unlabeled_maestro={n_unlabeled} | val={n_val}")
+        else:
+            print(f"[MAPS] train={n_train_labeled} | val={n_val}")
     else:
         total_str = max(total_train, 1)
         print(f"[SSL] label_frac={args.label_frac:.1%} | "
@@ -299,7 +341,7 @@ if __name__ == "__main__":
 
     # Cache directory: MAPS uses its own subdir to avoid collision with MAESTRO cache
     if args.maps_csv is not None:
-        cache_subdir = "MAPS"
+        cache_subdir = "MAPS_MAESTRO" if args.maps_labeled_maestro_unlabeled else "MAPS"
     else:
         cache_subdir = "maestro-v3.0.0"
     pairs_real = {"train": unlabeled_wavs}

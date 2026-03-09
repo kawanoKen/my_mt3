@@ -1,15 +1,18 @@
-# run/train_maestro_ddp_SSL.py
+#!/usr/bin/env python3
+# run_mt3/train_maestro_ddp_SSL_iter.py
 #
-# Semi-supervised training on MAESTRO:
+# Semi-supervised training on MAESTRO (iteration-based):
 #   - A small fraction of MAESTRO train is used as labeled data
 #   - The rest is treated as unlabeled (pseudo-label with confidence filtering)
 #   - Validation split is kept intact for evaluation
 #
+# Epoch-based version: train_maestro_ddp_SSL.py
+#
 # Usage:
-#   python -m torch.distributed.run --nproc_per_node=4 run/train_maestro_ddp_SSL.py \
+#   python -m torch.distributed.run --nproc_per_node=4 run_mt3/train_maestro_ddp_SSL_iter.py \
 #     --root dataset/maestro-v3.0.0 \
 #     --label_frac 0.05 \
-#     --epochs 200 --bs 8
+#     --iters 50000 --bs 8
 
 import sys, pathlib
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
@@ -18,15 +21,16 @@ import os
 import argparse
 import random
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple
 from datetime import datetime
 
 import pandas as pd
 import warnings
 from tqdm import tqdm
 
-from my_mt3.tokenizer import build_vocab
+from my_mt3.tokenizer import build_vocab, INPUT_FRAMES
 from my_mt3.audio import ensure_wave_cache
+from my_mt3.train_DA_confusion_iter import train_loop_distributed_DA_confusion_iter
 import concurrent.futures as futures
 import csv
 import json
@@ -43,15 +47,6 @@ def collect_pairs_maestro_ssl(
     program_id: int = 0,
     require_exists: bool = True,
 ) -> Tuple[Dict[str, List[Tuple[str, ...]]], List[str], List[str]]:
-    """
-    MAESTRO train split を labeled / unlabeled に分割。
-    validation/test はそのまま返す。
-
-    Returns:
-      pairs_labeled: {"train": [...], "validation": [...]}
-      unlabeled_wavs: List[str]  (audio paths only, no MIDI)
-      unlabeled_midis: List[str] (corresponding MIDI paths, for oracle filter)
-    """
     root = Path(root)
     csv_path = root / "maestro-v3.0.0.csv"
     if not csv_path.exists():
@@ -90,7 +85,6 @@ def collect_pairs_maestro_ssl(
         "train": labeled,
         "validation": val_pairs,
     }
-
     return pairs_labeled, unlabeled_wavs, unlabeled_midis
 
 
@@ -100,10 +94,6 @@ def load_split_from_csv(
     *,
     program_id: int = 0,
 ) -> Tuple[Dict[str, List[Tuple[str, ...]]], List[str], List[str]]:
-    """
-    保存済み ssl_split.csv から labeled/unlabeled 分割を復元。
-    validation は MAESTRO CSV から別途取得。
-    """
     root = Path(root)
     split_df = pd.read_csv(split_csv)
 
@@ -137,13 +127,6 @@ def load_maps_csv(
     *,
     program_id: int = 0,
 ) -> Tuple[Dict[str, List[Tuple[str, ...]]], List[str], List[str]]:
-    """MAPS_*_scenario.csv (split/audio_path/midi_path/...) を読み込む。
-
-    Returns:
-      pairs_labeled: {"train": [...], "validation": [...]}
-      unlabeled_wavs: [] (MAPS は全て有ラベルなので空)
-      unlabeled_midis: []
-    """
     df = pd.read_csv(maps_csv)
     train_pairs: List[Tuple[str, str, int]] = []
     val_pairs: List[Tuple[str, str, int]] = []
@@ -161,12 +144,6 @@ def load_maestro_unlabeled(
     *,
     require_exists: bool = True,
 ) -> Tuple[List[str], List[str]]:
-    """
-    MAESTRO train split を unlabeled 用に読み込む。
-    Returns:
-      unlabeled_wavs: List[str]
-      unlabeled_midis: List[str]  # oracle_filter 用
-    """
     root = Path(root)
     csv_path = root / "maestro-v3.0.0.csv"
     if not csv_path.exists():
@@ -186,85 +163,92 @@ def load_maestro_unlabeled(
             continue
         unlabeled_wavs.append(str(audio_path))
         unlabeled_midis.append(str(midi_path))
-
     return unlabeled_wavs, unlabeled_midis
 
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser(description="Semi-supervised MAESTRO training (partial labels)")
+    ap = argparse.ArgumentParser(description="Semi-supervised MAESTRO training (iteration-based)")
     ap.add_argument("--root", type=str, default="dataset/maestro-v3.0.0",
-                     help="MAESTRO v3.0.0 root directory")
+                    help="MAESTRO v3.0.0 root directory")
     ap.add_argument("--label_frac", type=float, default=0.1,
-                     help="fraction of MAESTRO train to use as labeled (0.0-1.0)")
+                    help="fraction of MAESTRO train to use as labeled (0.0-1.0)")
     ap.add_argument("--label_seed", type=int, default=42,
-                     help="random seed for labeled/unlabeled split")
+                    help="random seed for labeled/unlabeled split")
     ap.add_argument("--split_csv", type=str, default=None,
-                     help="path to a saved ssl_split.csv to reproduce an exact split "
-                          "(overrides --label_frac and --label_seed)")
+                    help="path to a saved ssl_split.csv to reproduce an exact split "
+                         "(overrides --label_frac and --label_seed)")
     ap.add_argument("--maps_csv", type=str, default=None,
-                     help="path to a MAPS_*_scenario.csv (overrides --root/--split_csv; "
-                          "supervised-only, no pseudo-label)")
+                    help="path to a MAPS_*_scenario.csv (overrides --root/--split_csv; "
+                         "supervised-only if --maps_labeled_maestro_unlabeled is not set)")
     ap.add_argument("--maps_labeled_maestro_unlabeled", action="store_true",
-                     help="use MAPS (maps_csv) as labeled data and MAESTRO train (root) as unlabeled data")
-    ap.add_argument("--epochs", type=int, default=5000)
+                    help="use MAPS (maps_csv) as labeled data and MAESTRO train (root) as unlabeled data")
+
+    ap.add_argument("--iters", type=int, default=50_000)
     ap.add_argument("--bs", type=int, default=4)
     ap.add_argument("--lr_t", type=float, default=2e-4, help="Transformer lr")
-    ap.add_argument("--input_frames", type=int, default=256,
-                     help="segment length in frames (hop=256, sr=16k: 121 ~ 2.048s)")
-    ap.add_argument("--lr_warmup_epochs", type=int, default=100,
-                     help="number of warmup epochs for LR scheduler")
+    ap.add_argument("--input_frames", type=int, default=INPUT_FRAMES,
+                    help="segment length in frames")
+    ap.add_argument("--lr_warmup_steps", type=int, default=0,
+                    help="number of warmup steps for LR scheduler")
     ap.add_argument("--lr_min_ratio", type=float, default=0.1,
-                     help="minimum LR ratio for cosine decay scheduler")
+                    help="minimum LR ratio for cosine decay scheduler")
 
     # Pseudo-label (SSL)
-    ap.add_argument("--pseudo_start_epoch", type=int, default=1000,
-                     help="start pseudo-label training from this epoch")
+    ap.add_argument("--pseudo_start_step", type=int, default=4000,
+                    help="start pseudo-label training from this step")
     ap.add_argument("--ema_decay", type=float, default=0.999)
     ap.add_argument("--unsup_weight", type=float, default=1.0,
-                     help="weight for unsupervised pseudo-label loss")
+                    help="weight for unsupervised pseudo-label loss")
     ap.add_argument("--pseudo_max_len", type=int, default=1024)
-    ap.add_argument("--pseudo_threshold", type=float, default=-0.5,
-                     help="chunk-level mean log-prob threshold for pseudo-label (used when pseudo_topn=0)")
+    ap.add_argument("--pseudo_threshold", type=float, default=-0.6,
+                    help="chunk-level mean log-prob threshold for pseudo-label (used when pseudo_topn=0)")
     ap.add_argument("--pseudo_topn", type=int, default=0,
-                     help="select top-N most confident chunks per batch as pseudo-labels "
-                          "(0=use threshold mode instead)")
+                    help="select top-N most confident chunks per batch as pseudo-labels "
+                         "(0=use threshold mode instead)")
     ap.add_argument("--pseudo_note_target_only", action="store_true",
-                     help="compute unsupervised loss only on pseudo note tokens filtered by note confidence")
-    ap.add_argument("--pseudo_note_threshold", type=float, default=-0.5,
-                     help="minimum note-level confidence to keep pseudo note tokens")
+                    help="after chunk filtering, compute unsupervised loss only on selected pseudo note tokens")
     ap.add_argument("--pseudo_note_onset_only", action="store_true",
-                     help="when pseudo_note_target_only is enabled, keep only note-on tokens")
-    ap.add_argument("--pseudo_note_without_chunk", action="store_true",
-                     help="when pseudo_note_target_only is enabled, ignore chunk filter and use token-only mask")
+                    help="when pseudo_note_target_only is enabled, keep only NOTE_ON tokens for loss")
+    ap.add_argument("--pseudo_note_threshold", type=float, default=-0.5,
+                    help="note-level mean log-prob threshold for token filtering")
 
     # Pretrained
     ap.add_argument("--pretrained_ckpt", type=str, default=None,
-                     help="path to a pretrained MT3 checkpoint (.pt) to initialise model weights")
+                    help="path to a pretrained MT3 checkpoint (.pt) to initialise model weights")
 
-    # Oracle filter (実験用: 正解 MIDI で疑似ラベルをフィルタ)
+    # Oracle filter
     ap.add_argument("--oracle_filter", action="store_true",
-                     help="use ground-truth MIDI to filter pseudo-labels (oracle experiment)")
+                    help="use ground-truth MIDI to filter pseudo-labels (oracle experiment)")
     ap.add_argument("--oracle_metric", type=str, default="note_f",
-                     help="evaluation metric for oracle filter (default: note_f)")
+                    help="evaluation metric for oracle filter (default: note_f)")
     ap.add_argument("--oracle_threshold", type=float, default=0.5,
-                     help="minimum metric value to keep a pseudo-label chunk")
+                    help="minimum metric value to keep a pseudo-label chunk")
     ap.add_argument("--oracle_note_target_only", action="store_true",
-                     help="after oracle chunk filtering, compute unsupervised loss only on "
-                          "pseudo note tokens matched to GT notes (same pitch, close onset/offset)")
-    ap.add_argument("--oracle_note_without_chunk", action="store_true",
-                     help="when oracle_note_target_only is enabled, ignore oracle chunk filter and use token-only mask")
+                    help="after oracle chunk filtering, compute unsupervised loss only on "
+                         "pseudo note tokens matched to GT notes")
 
-    # Saving
-    ap.add_argument("--save-every", type=int, default=100)
-    ap.add_argument("--save-dir", type=str, default=None)
+    # Saving / logging
+    ap.add_argument("--save_every", type=int, default=0,
+                    help="save numbered checkpoint every N steps (0=off)")
+    ap.add_argument("--ckpt_every", type=int, default=1000,
+                    help="save last.pt every N steps")
+    ap.add_argument("--valid_every", type=int, default=2000,
+                    help="run validation every N steps")
+    ap.add_argument("--log_every", type=int, default=10)
+    ap.add_argument("--keep_last_n", type=int, default=0)
+    ap.add_argument("--save_dir", type=str, default=None)
+
+    # Training misc
+    ap.add_argument("--grad_clip", type=float, default=0.0,
+                    help="max norm for gradient clipping (0=disabled)")
 
     # Cache
-    ap.add_argument("--no-cache", action="store_true")
-    ap.add_argument("--cache-root", type=str, default="cache/wave_sr16000")
+    ap.add_argument("--no_cache", action="store_true")
+    ap.add_argument("--cache_root", type=str, default="cache/wave_sr16000")
     ap.add_argument("--sr", type=int, default=16000)
     ap.add_argument("--prefetch_cache_workers", type=int, default=0)
     ap.add_argument("--no_augment", action="store_true",
-                     help="disable spectrogram augmentation for SSL pseudo-label student step")
+                    help="disable spectrogram augmentation for SSL pseudo-label student step")
     args = ap.parse_args()
 
     # Output directory
@@ -272,10 +256,10 @@ if __name__ == "__main__":
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         if args.maps_csv is not None:
             scenario = Path(args.maps_csv).stem
-            save_dir = os.path.join("checkpoints_MAPS", f"run_{ts}_{scenario}")
+            save_dir = os.path.join("checkpoints_MAPS_SSL_iter", f"run_{ts}_{scenario}")
         else:
             frac_str = f"{args.label_frac:.0%}".replace("%", "pct")
-            save_dir = os.path.join("checkpoints_maestro_SSL", f"run_{ts}_frac{frac_str}")
+            save_dir = os.path.join("checkpoints_maestro_SSL_iter", f"run_{ts}_frac{frac_str}")
     else:
         save_dir = args.save_dir
     os.makedirs(save_dir, exist_ok=True)
@@ -312,17 +296,15 @@ if __name__ == "__main__":
             print(f"[MAPS] train={n_train_labeled} | val={n_val}")
     else:
         total_str = max(total_train, 1)
-        print(f"[SSL] label_frac={args.label_frac:.1%} | "
+        print(f"[SSL-iter] label_frac={args.label_frac:.1%} | "
               f"labeled={n_train_labeled} ({n_train_labeled/total_str:.1%}) | "
               f"unlabeled={n_unlabeled} ({n_unlabeled/total_str:.1%}) | "
               f"val={n_val}")
 
-    # Vocab
     vocab = build_vocab(input_frames=args.input_frames, instrument_type="piano", include_note_off=True)
 
-    # ===== Save meta.json =====
     meta = {
-        "script": "train_maestro_ddp_SSL.py",
+        "script": "train_maestro_ddp_SSL_iter.py",
         "timestamp": datetime.now().isoformat(),
         "args": vars(args),
         "data": {
@@ -338,7 +320,6 @@ if __name__ == "__main__":
         json.dump(meta, f, indent=2, ensure_ascii=False)
     print(f"Meta saved -> {meta_path}")
 
-    # Save split info (always, so the exact split is reproducible from this run)
     split_out = os.path.join(save_dir, "ssl_split.csv")
     with open(split_out, "w", newline="") as f:
         w = csv.writer(f)
@@ -349,7 +330,6 @@ if __name__ == "__main__":
             w.writerow(["unlabeled", wav, midi])
     print(f"Split info saved -> {split_out}")
 
-    # Cache directory: MAPS uses its own subdir to avoid collision with MAESTRO cache
     if args.maps_csv is not None:
         cache_subdir = "MAPS_MAESTRO" if args.maps_labeled_maestro_unlabeled else "MAPS"
     else:
@@ -369,11 +349,13 @@ if __name__ == "__main__":
                 return []
             if args.prefetch_cache_workers > 0:
                 print(f"[cache:{title}] prefetch: {len(wavs)} files -> {cache_dir}")
+
                 def _cache_one(w):
                     try:
                         return ensure_wave_cache(w, cache_dir=cache_dir, sr=args.sr)
                     except Exception as e:
                         return f"ERR:{w}:{e}"
+
                 with futures.ThreadPoolExecutor(max_workers=int(args.prefetch_cache_workers)) as ex:
                     cached = list(tqdm(ex.map(_cache_one, wavs), total=len(wavs),
                                        desc=f"prefetch {title}", unit="wav"))
@@ -384,18 +366,13 @@ if __name__ == "__main__":
         cached_all = _prefetch_set(all_wavs, cache_dir_maestro, "maestro")
         w2c = dict(zip(all_wavs, cached_all))
 
-        pairs_labeled["train"] = [(w2c.get(w, w), m, pid)
-                                   for (w, m, pid) in pairs_labeled["train"]]
-        pairs_labeled["validation"] = [(w2c.get(w, w), m, pid)
-                                        for (w, m, pid) in pairs_labeled["validation"]]
+        pairs_labeled["train"] = [(w2c.get(w, w), m, pid) for (w, m, pid) in pairs_labeled["train"]]
+        pairs_labeled["validation"] = [(w2c.get(w, w), m, pid) for (w, m, pid) in pairs_labeled["validation"]]
         pairs_real = {"train": [w2c.get(w, w) for w in unlabeled_wavs]}
 
     print(f"Checkpoints -> {save_dir}")
 
-    # Use the confusion-based training loop (no discriminator, pseudo-label only)
-    from my_mt3.train_DA_confusion import train_loop_distributed_DA_confusion
-
-    model = train_loop_distributed_DA_confusion(
+    _ = train_loop_distributed_DA_confusion_iter(
         pairs_labeled,
         vocab=vocab,
         use_dc=False,
@@ -406,7 +383,7 @@ if __name__ == "__main__":
         chunk_frames=None,
         disc_hidden=256,
         use_pseudo=True,
-        pseudo_start_epoch=args.pseudo_start_epoch,
+        pseudo_start_step=args.pseudo_start_step,
         ema_decay=args.ema_decay,
         unsup_weight=args.unsup_weight,
         pseudo_max_len=args.pseudo_max_len,
@@ -418,18 +395,21 @@ if __name__ == "__main__":
         oracle_threshold=args.oracle_threshold,
         oracle_midi_paths=unlabeled_midis if args.oracle_filter else None,
         oracle_note_target_only=args.oracle_note_target_only,
-        oracle_note_without_chunk=args.oracle_note_without_chunk,
         pseudo_note_target_only=args.pseudo_note_target_only,
         pseudo_note_onset_only=args.pseudo_note_onset_only,
         pseudo_note_threshold=args.pseudo_note_threshold,
-        pseudo_note_without_chunk=args.pseudo_note_without_chunk,
         use_augment=not args.no_augment,
-        epochs=args.epochs,
+        grad_clip=args.grad_clip,
+        iters=args.iters,
         bs=args.bs,
         input_frames=args.input_frames,
-        lr_warmup_epochs=args.lr_warmup_epochs,
+        lr_warmup_steps=args.lr_warmup_steps,
         lr_min_ratio=args.lr_min_ratio,
         save_every=args.save_every,
+        ckpt_every=args.ckpt_every,
+        valid_every=args.valid_every,
+        log_every=args.log_every,
+        keep_last_n=args.keep_last_n,
         save_dir=save_dir,
         use_cache=False,
         cache_dir=args.cache_root,
@@ -437,49 +417,5 @@ if __name__ == "__main__":
         num_workers=2,
     )
 
-    # Plot losses
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-
-        xs, total, sup, unsup, val_l, val_acc = [], [], [], [], [], []
-        csv_path = Path(save_dir) / "da_losses.csv"
-        if csv_path.exists():
-            with open(csv_path, "r") as f:
-                r = csv.DictReader(f)
-                for row in r:
-                    xs.append(int(row["epoch"]))
-                    total.append(float(row["train_total"]))
-                    sup.append(float(row["train_sup"]))
-                    unsup.append(float(row["train_unsup"]))
-                    val_l.append(float(row["val_loss"]))
-                    val_acc.append(float(row.get("val_token_acc", "0") or 0.0))
-
-            fig, ax = plt.subplots(figsize=(10, 5))
-            ax.plot(xs, total, label="total")
-            ax.plot(xs, sup, label="supervised")
-            ax.plot(xs, unsup, label="pseudo-label (unsup)")
-            if any(val_l):
-                ax.plot(xs, val_l, label="val_loss", linestyle="--")
-            if any(val_acc):
-                ax.plot(xs, val_acc, label="val_token_acc", linestyle="-.")
-            ax.axvline(x=args.pseudo_start_epoch, color="gray", linestyle=":",
-                       label=f"pseudo start (ep {args.pseudo_start_epoch})")
-            ax.set_xlabel("epoch")
-            ax.set_ylabel("loss")
-            ax.set_title(f"SSL Training  (label_frac={args.label_frac:.1%})")
-            ax.legend()
-            ax.grid(True, alpha=0.3)
-            fig.tight_layout()
-            fig_path = Path(save_dir) / "ssl_losses.png"
-            fig.savefig(fig_path, dpi=150)
-            plt.close(fig)
-            print(f"Loss plot -> {fig_path}")
-    except Exception as e:
-        print(f"(warn) failed to plot: {e}")
-
     print(f"Training finished -> {save_dir}")
 
-# python -m torch.distributed.run --nproc_per_node=4 run/train_maestro_ddp_SSL.py \
-#   --root dataset/maestro-v3.0.0 --label_frac 0.05 --epochs 200 --bs 8

@@ -525,6 +525,11 @@ def train_loop_distributed_DA_confusion(
     oracle_threshold: float = 0.5,
     oracle_midi_paths: list | None = None,
     oracle_note_target_only: bool = False,
+    oracle_note_without_chunk: bool = False,
+    pseudo_note_target_only: bool = False,
+    pseudo_note_onset_only: bool = False,
+    pseudo_note_threshold: float = -0.5,
+    pseudo_note_without_chunk: bool = False,
     # ---- Augmentation ----
     use_augment: bool = True,
     # ---- 既存 ----
@@ -654,7 +659,15 @@ def train_loop_distributed_DA_confusion(
             print(f"[oracle] cached {len(oracle_midi_cache)} / {len(oracle_midi_paths)} MIDIs")
             print(f"[oracle] metric={oracle_metric}  threshold={oracle_threshold}")
             if oracle_note_target_only:
-                print("[oracle] note-target-only mode enabled")
+                msg = "[oracle] note-target-only mode enabled"
+                if oracle_note_without_chunk:
+                    msg += " (without chunk filter)"
+                print(msg)
+    if rank == 0 and pseudo_note_target_only:
+        msg = "[pseudo-note] token-target-only mode enabled"
+        if pseudo_note_without_chunk:
+            msg += " (without chunk filter)"
+        print(msg)
 
     # ---- models ----
     model = MT3Mini(vocab_size=len(vocab.itos)).to(device)
@@ -826,7 +839,13 @@ def train_loop_distributed_DA_confusion(
                         pseudo_topn=pseudo_topn,
                     )
 
-                if chunk_mask.any():
+                use_token_only_without_chunk = bool(pseudo_note_target_only and pseudo_note_without_chunk)
+                use_oracle_token_only_without_chunk = bool(
+                    oracle_note_target_only and oracle_note_without_chunk and oracle_filter
+                )
+                can_use_unsup = bool(chunk_mask.any()) or use_token_only_without_chunk or use_oracle_token_only_without_chunk
+
+                if can_use_unsup:
                     running_pseudo_chunks += int(chunk_mask.sum().item())
                     if oracle_note_target_only and oracle_filter and oracle_midi_cache and real_idxs is not None:
                         note_mask = oracle_note_token_mask(
@@ -841,10 +860,50 @@ def train_loop_distributed_DA_confusion(
                             offset_min_tolerance=0.05,
                             device=device,
                         )
-                        final_mask = note_mask & chunk_mask.unsqueeze(1)
+                        if oracle_note_without_chunk:
+                            final_mask = note_mask
+                        else:
+                            final_mask = note_mask & chunk_mask.unsqueeze(1)
                         y_tg_masked = torch.full_like(y_tg_p, pad_id)
                         y_tg_masked[final_mask] = y_tg_p[final_mask]
                         note_on_ids = set(vocab.note_on.values())
+                        note_count = 0
+                        if final_mask.any():
+                            selected_tokens = y_tg_p[final_mask].tolist()
+                            note_count = sum(1 for t in selected_tokens if t in note_on_ids)
+                        running_pseudo_notes += int(note_count)
+                    elif pseudo_note_target_only:
+                        note_mask = torch.zeros_like(y_tg_p, dtype=torch.bool)
+                        note_on_ids = set(vocab.note_on.values())
+                        if use_token_only_without_chunk:
+                            target_idxs = list(range(out.size(0)))
+                        else:
+                            target_idxs = torch.where(chunk_mask)[0].tolist()
+
+                        for b_idx in target_idxs:
+                            spans = decode_notes_to_spans(out[b_idx].tolist(), vocab)
+                            if len(spans) == 0:
+                                continue
+                            scores = build_note_confidences(spans, log_prob[b_idx])
+                            keep_note_idxs = np.where(scores >= float(pseudo_note_threshold))[0].tolist()
+                            if not keep_note_idxs:
+                                continue
+                            for n_idx in keep_note_idxs:
+                                for t_idx in spans[n_idx].tok_ids:
+                                    if 0 <= int(t_idx) < y_tg_p.size(1):
+                                        note_mask[b_idx, int(t_idx)] = True
+
+                        final_mask = note_mask
+                        if not use_token_only_without_chunk:
+                            final_mask = final_mask & chunk_mask.unsqueeze(1)
+                        if pseudo_note_onset_only:
+                            onset_mask = torch.zeros_like(y_tg_p, dtype=torch.bool)
+                            for note_on_id in note_on_ids:
+                                onset_mask |= (y_tg_p == int(note_on_id))
+                            final_mask &= onset_mask
+
+                        y_tg_masked = torch.full_like(y_tg_p, pad_id)
+                        y_tg_masked[final_mask] = y_tg_p[final_mask]
                         note_count = 0
                         if final_mask.any():
                             selected_tokens = y_tg_p[final_mask].tolist()

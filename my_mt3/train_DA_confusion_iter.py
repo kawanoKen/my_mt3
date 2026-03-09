@@ -30,6 +30,7 @@ from my_mt3.train_DA_confusion import (
     oracle_chunk_filter,
     oracle_note_token_mask,
     decode_notes_to_spans,
+    build_note_confidences,
 )
 from my_mt3.augment import AugmentConfig, augment_spectrogram
 
@@ -66,6 +67,9 @@ def train_loop_distributed_DA_confusion_iter(
     oracle_threshold: float = 0.5,
     oracle_midi_paths: list | None = None,
     oracle_note_target_only: bool = False,
+    pseudo_note_target_only: bool = False,
+    pseudo_note_onset_only: bool = False,
+    pseudo_note_threshold: float = -0.5,
     # ---- Augmentation ----
     use_augment: bool = True,
     # ---- gradient clipping ----
@@ -381,6 +385,38 @@ def train_loop_distributed_DA_confusion_iter(
                     y_tg_masked = torch.full_like(y_tg_p, pad_id)
                     y_tg_masked[final_mask] = y_tg_p[final_mask]
                     note_on_ids = set(vocab.note_on.values())
+                    note_count = 0
+                    if final_mask.any():
+                        selected_tokens = y_tg_p[final_mask].tolist()
+                        note_count = sum(1 for t in selected_tokens if t in note_on_ids)
+                    running_pseudo_notes += int(note_count)
+                elif pseudo_note_target_only:
+                    note_mask = torch.zeros_like(y_tg_p, dtype=torch.bool)
+                    note_on_ids = set(vocab.note_on.values())
+                    kept_idxs = torch.where(chunk_mask)[0].tolist()
+                    for b_idx in kept_idxs:
+                        spans = decode_notes_to_spans(out[b_idx].tolist(), vocab)
+                        if len(spans) == 0:
+                            continue
+                        scores = build_note_confidences(spans, log_prob[b_idx])
+                        keep_note_idxs = np.where(scores >= float(pseudo_note_threshold))[0].tolist()
+                        if not keep_note_idxs:
+                            continue
+                        for n_idx in keep_note_idxs:
+                            for t_idx in spans[n_idx].tok_ids:
+                                if 0 <= int(t_idx) < y_tg_p.size(1):
+                                    note_mask[b_idx, int(t_idx)] = True
+
+                    final_mask = note_mask & chunk_mask.unsqueeze(1)
+                    if pseudo_note_onset_only:
+                        onset_mask = torch.zeros_like(y_tg_p, dtype=torch.bool)
+                        for note_on_id in note_on_ids:
+                            onset_mask |= (y_tg_p == int(note_on_id))
+                        final_mask &= onset_mask
+
+                    y_tg_masked = torch.full_like(y_tg_p, pad_id)
+                    y_tg_masked[final_mask] = y_tg_p[final_mask]
+
                     note_count = 0
                     if final_mask.any():
                         selected_tokens = y_tg_p[final_mask].tolist()

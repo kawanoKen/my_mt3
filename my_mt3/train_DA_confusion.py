@@ -14,6 +14,7 @@ from my_mt3.dataset_unlabeled import AMTRealDataset
 from my_mt3.discriminator import Discriminator
 from my_mt3.audio import ensure_wave_cache, DEFAULT_SR
 import os
+import re
 import itertools
 
 import torch.distributed as dist
@@ -519,6 +520,7 @@ def train_loop_distributed_DA_confusion(
     pseudo_topn: int = 0,
     # ---- 事前学習重み ----
     pretrained_ckpt: str | None = None,
+    resume_ckpt: str | None = None,
     # ---- Oracle filter (実験用) ----
     oracle_filter: bool = False,
     oracle_metric: str = "note_f",
@@ -671,7 +673,7 @@ def train_loop_distributed_DA_confusion(
 
     # ---- models ----
     model = MT3Mini(vocab_size=len(vocab.itos)).to(device)
-    if pretrained_ckpt is not None:
+    if (pretrained_ckpt is not None) and (resume_ckpt is None):
         ckpt = torch.load(pretrained_ckpt, map_location=device, weights_only=True)
         state = ckpt if not isinstance(ckpt, dict) else ckpt.get("model", ckpt)
         missing, unexpected = model.load_state_dict(state, strict=False)
@@ -720,18 +722,71 @@ def train_loop_distributed_DA_confusion(
         # DA損失ログCSVを初期化
         try:
             import csv as _csv
-            with open(os.path.join(save_dir, "da_losses.csv"), "w", newline="") as f:
+            csv_path = os.path.join(save_dir, "da_losses.csv")
+            file_exists = os.path.exists(csv_path) and os.path.getsize(csv_path) > 0
+            mode = "a" if (resume_ckpt is not None and file_exists) else "w"
+            with open(csv_path, mode, newline="") as f:
                 w = _csv.writer(f)
-                w.writerow([
-                    "epoch", "train_total", "train_sup", "train_adv", "train_unsup", "train_disc", "val_loss",
-                    "val_token_acc", "pseudo_chunks", "pseudo_notes"
-                ])
+                if mode == "w":
+                    w.writerow([
+                        "epoch", "train_total", "train_sup", "train_adv", "train_unsup", "train_disc", "val_loss",
+                        "val_token_acc", "pseudo_chunks", "pseudo_notes"
+                    ])
         except Exception:
             pass
     ema = EMATeacher(model_ddp.module, decay=ema_decay)
+    start_epoch = 0
+
+    if resume_ckpt is not None:
+        ckpt_obj = torch.load(resume_ckpt, map_location=device, weights_only=False)
+        if isinstance(ckpt_obj, dict) and ("model" in ckpt_obj):
+            missing, unexpected = model_ddp.module.load_state_dict(ckpt_obj["model"], strict=False)
+            if rank == 0:
+                print(f"[resume] loaded model from {resume_ckpt}")
+                if missing:
+                    print(f"  missing keys : {missing}")
+                if unexpected:
+                    print(f"  unexpected keys: {unexpected}")
+            if "optimizer_t" in ckpt_obj:
+                opt_t.load_state_dict(ckpt_obj["optimizer_t"])
+            if "scheduler_t" in ckpt_obj:
+                sch_t.load_state_dict(ckpt_obj["scheduler_t"])
+            if "ema_teacher" in ckpt_obj:
+                ema.teacher.load_state_dict(ckpt_obj["ema_teacher"], strict=False)
+            if use_dc and disc_ddp is not None:
+                if "disc" in ckpt_obj:
+                    disc_ddp.module.load_state_dict(ckpt_obj["disc"], strict=False)
+                if ("optimizer_c" in ckpt_obj) and ("opt_c" in locals()):
+                    opt_c.load_state_dict(ckpt_obj["optimizer_c"])
+            start_epoch = int(ckpt_obj.get("epoch", -1)) + 1
+            start_epoch = max(0, start_epoch)
+        else:
+            state = ckpt_obj if not isinstance(ckpt_obj, dict) else ckpt_obj.get("model", ckpt_obj)
+            model_ddp.module.load_state_dict(state, strict=False)
+            ckpt_name = os.path.basename(str(resume_ckpt))
+            m = re.search(r"ep(\d+)\.pt$", ckpt_name)
+            start_epoch = int(m.group(1)) if m else 0
+            if rank == 0:
+                print(f"[resume] model-only checkpoint loaded from {resume_ckpt}")
+                print("[resume] optimizer/scheduler state not found; using fresh optimizer")
+                if m:
+                    print(f"[resume] inferred start epoch from filename: {start_epoch}")
+
+        if rank == 0:
+            print(f"[resume] start_epoch={start_epoch + 1} / target_epochs={epochs}")
+
+    if rank == 0 and (pretrained_ckpt is not None) and (resume_ckpt is not None):
+        print("[resume] --resume_ckpt is set; --pretrained_ckpt is ignored")
+
+    if start_epoch >= int(epochs):
+        if rank == 0:
+            print(f"[resume] start_epoch ({start_epoch}) >= epochs ({epochs}); nothing to train")
+        dist.destroy_process_group()
+        return model_ddp
+
     aug_cfg = AugmentConfig() if use_augment else None
     # ---- loop ----
-    for ep in range(epochs):
+    for ep in range(start_epoch, epochs):
         train_sampler.set_epoch(ep)
         if (use_dc or use_pseudo) and real_dl is not None:
             real_sampler.set_epoch(ep)
@@ -999,6 +1054,22 @@ def train_loop_distributed_DA_confusion(
                 pass
 
             if (ep + 1) % save_every == 0 or (ep + 1) == epochs:
+                train_state_path = os.path.join(save_dir, f"train_state_ep{ep+1}.pt")
+                train_state = {
+                    "epoch": ep,
+                    "model": model_ddp.module.state_dict(),
+                    "optimizer_t": opt_t.state_dict(),
+                    "scheduler_t": sch_t.state_dict(),
+                    "ema_teacher": ema.teacher.state_dict(),
+                    "use_dc": bool(use_dc),
+                }
+                if use_dc and disc_ddp is not None:
+                    train_state["disc"] = disc_ddp.module.state_dict()
+                    if "opt_c" in locals():
+                        train_state["optimizer_c"] = opt_c.state_dict()
+                torch.save(train_state, train_state_path)
+                print(f"✅ saved -> {train_state_path}")
+
                 save_path = os.path.join(save_dir, f"model_ep{ep+1}.pt")
                 torch.save(model_ddp.module.state_dict(), save_path)
                 print(f"✅ saved -> {save_path}")

@@ -17,6 +17,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import os
 import argparse
 import random
+import re
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 from datetime import datetime
@@ -190,6 +191,90 @@ def load_maestro_unlabeled(
     return unlabeled_wavs, unlabeled_midis
 
 
+def _extract_epoch_num(path: Path, prefix: str) -> int:
+    m = re.search(rf"{re.escape(prefix)}(\d+)\.pt$", path.name)
+    return int(m.group(1)) if m else -1
+
+
+def resolve_resume_checkpoint(resume_path: str) -> tuple[str, bool]:
+    """
+    Resolve resume checkpoint path.
+    Returns:
+      (ckpt_path, is_full_training_state)
+    """
+    p = Path(resume_path)
+    if p.is_file():
+        is_full = p.name.startswith("train_state_ep")
+        return str(p), is_full
+
+    if p.is_dir():
+        full_states = sorted(
+            p.glob("train_state_ep*.pt"),
+            key=lambda x: _extract_epoch_num(x, "train_state_ep"),
+        )
+        if full_states:
+            return str(full_states[-1]), True
+
+        model_only = sorted(
+            p.glob("model_ep*.pt"),
+            key=lambda x: _extract_epoch_num(x, "model_ep"),
+        )
+        if model_only:
+            return str(model_only[-1]), False
+
+    raise FileNotFoundError(
+        f"no resume checkpoint found under: {resume_path} "
+        "(expected train_state_ep*.pt or model_ep*.pt)"
+    )
+
+
+def _collect_cli_option_keys(argv: list[str]) -> set[str]:
+    keys: set[str] = set()
+    for tok in argv:
+        if not tok.startswith("--"):
+            continue
+        key = tok[2:].split("=", 1)[0].strip()
+        if key:
+            keys.add(key.replace("-", "_"))
+    return keys
+
+
+def apply_meta_defaults(args, *, cli_keys: set[str], resume_dir: Path) -> None:
+    meta_path = resume_dir / "meta.json"
+    if not meta_path.exists():
+        print(f"[resume] meta.json not found: {meta_path}")
+        return
+    try:
+        with open(meta_path, "r") as f:
+            meta = json.load(f)
+    except Exception as e:
+        print(f"[resume] failed to load meta.json: {e}")
+        return
+
+    meta_args = meta.get("args", {})
+    if not isinstance(meta_args, dict):
+        print(f"[resume] invalid meta args format: {meta_path}")
+        return
+
+    skipped = {"resume_ckpt", "save_dir"}
+    restored = []
+    for k, v in meta_args.items():
+        if k in skipped:
+            continue
+        if k in cli_keys:
+            continue
+        if hasattr(args, k):
+            setattr(args, k, v)
+            restored.append(k)
+
+    if "save_dir" not in cli_keys and getattr(args, "save_dir", None) is None:
+        args.save_dir = str(resume_dir)
+        restored.append("save_dir")
+
+    if restored:
+        print(f"[resume] restored args from meta.json ({len(restored)}): {', '.join(sorted(restored))}")
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Semi-supervised MAESTRO training (partial labels)")
     ap.add_argument("--root", type=str, default="dataset/maestro-v3.0.0",
@@ -240,6 +325,9 @@ if __name__ == "__main__":
     # Pretrained
     ap.add_argument("--pretrained_ckpt", type=str, default=None,
                      help="path to a pretrained MT3 checkpoint (.pt) to initialise model weights")
+    ap.add_argument("--resume_ckpt", type=str, default=None,
+                     help="checkpoint path or run directory to resume training "
+                          "(prefers train_state_ep*.pt; falls back to model_ep*.pt)")
 
     # Oracle filter (実験用: 正解 MIDI で疑似ラベルをフィルタ)
     ap.add_argument("--oracle_filter", action="store_true",
@@ -266,6 +354,17 @@ if __name__ == "__main__":
     ap.add_argument("--no_augment", action="store_true",
                      help="disable spectrogram augmentation for SSL pseudo-label student step")
     args = ap.parse_args()
+    cli_keys = _collect_cli_option_keys(sys.argv[1:])
+
+    resume_ckpt = None
+    resume_dir = None
+    if args.resume_ckpt is not None:
+        resume_ckpt, is_full_state = resolve_resume_checkpoint(args.resume_ckpt)
+        resume_dir = Path(resume_ckpt).parent
+        print(f"[resume] checkpoint: {resume_ckpt}")
+        if not is_full_state:
+            print("[resume] WARNING: model-only checkpoint selected; optimizer/scheduler states are not available")
+        apply_meta_defaults(args, cli_keys=cli_keys, resume_dir=resume_dir)
 
     # Output directory
     if args.save_dir is None:
@@ -413,6 +512,7 @@ if __name__ == "__main__":
         pseudo_threshold=args.pseudo_threshold,
         pseudo_topn=args.pseudo_topn,
         pretrained_ckpt=args.pretrained_ckpt,
+        resume_ckpt=resume_ckpt,
         oracle_filter=args.oracle_filter,
         oracle_metric=args.oracle_metric,
         oracle_threshold=args.oracle_threshold,

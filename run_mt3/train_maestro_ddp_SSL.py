@@ -321,6 +321,12 @@ if __name__ == "__main__":
                      help="when pseudo_note_target_only is enabled, keep only note-on tokens")
     ap.add_argument("--pseudo_note_without_chunk", action="store_true",
                      help="when pseudo_note_target_only is enabled, ignore chunk filter and use token-only mask")
+    ap.add_argument("--pseudo_debug_n", type=int, default=0,
+                     help="save N pseudo-label debug samples (txt + piano roll) for kept chunks")
+    ap.add_argument("--pseudo_debug_dir", type=str, default=None,
+                     help="output directory for pseudo debug artifacts (default: <save_dir>/pseudo_debug)")
+    ap.add_argument("--pseudo_debug_start_epoch", type=int, default=0,
+                     help="(deprecated) ignored; pseudo debug always starts at pseudo_start_epoch")
 
     # Pretrained
     ap.add_argument("--pretrained_ckpt", type=str, default=None,
@@ -365,6 +371,9 @@ if __name__ == "__main__":
         if not is_full_state:
             print("[resume] WARNING: model-only checkpoint selected; optimizer/scheduler states are not available")
         apply_meta_defaults(args, cli_keys=cli_keys, resume_dir=resume_dir)
+
+    if int(getattr(args, "pseudo_debug_start_epoch", 0)) > 0:
+        print("[pseudo-debug] --pseudo_debug_start_epoch is ignored; start is fixed at --pseudo_start_epoch")
 
     # Output directory
     if args.save_dir is None:
@@ -516,13 +525,16 @@ if __name__ == "__main__":
         oracle_filter=args.oracle_filter,
         oracle_metric=args.oracle_metric,
         oracle_threshold=args.oracle_threshold,
-        oracle_midi_paths=unlabeled_midis if args.oracle_filter else None,
+        oracle_midi_paths=unlabeled_midis if (args.oracle_filter or args.pseudo_debug_n > 0) else None,
         oracle_note_target_only=args.oracle_note_target_only,
         oracle_note_without_chunk=args.oracle_note_without_chunk,
         pseudo_note_target_only=args.pseudo_note_target_only,
         pseudo_note_onset_only=args.pseudo_note_onset_only,
         pseudo_note_threshold=args.pseudo_note_threshold,
         pseudo_note_without_chunk=args.pseudo_note_without_chunk,
+        pseudo_debug_n=args.pseudo_debug_n,
+        pseudo_debug_dir=args.pseudo_debug_dir,
+        pseudo_debug_start_epoch=args.pseudo_debug_start_epoch,
         use_augment=not args.no_augment,
         epochs=args.epochs,
         bs=args.bs,

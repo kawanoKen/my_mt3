@@ -16,6 +16,7 @@ from my_mt3.audio import ensure_wave_cache, DEFAULT_SR
 import os
 import re
 import itertools
+import json
 
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -452,6 +453,188 @@ def oracle_chunk_filter(
     return mask
 
 
+def _save_pseudo_debug_sample(
+    *,
+    out_tokens: List[int],
+    log_prob_row: torch.Tensor,
+    selected_token_mask_row: torch.Tensor,
+    chunk_selected: bool,
+    save_root: str,
+    sample_idx: int,
+    epoch: int,
+    batch_idx: int,
+    in_batch_idx: int,
+    vocab: Vocab,
+    gt_intervals: np.ndarray,
+    gt_pitches: np.ndarray,
+    window_sec: float,
+    step_ms: int = 10,
+    chunk_keep_ratio_batch: float | None = None,
+    token_keep_ratio_batch: float | None = None,
+):
+    from matplotlib import pyplot as plt
+    from matplotlib.patches import Rectangle
+
+    os.makedirs(save_root, exist_ok=True)
+    stem = f"sample_{sample_idx:04d}_ep{epoch:05d}_b{batch_idx:05d}_i{in_batch_idx:02d}"
+    txt_path = os.path.join(save_root, f"{stem}.txt")
+    png_path = os.path.join(save_root, f"{stem}.png")
+
+    pad_id = int(vocab.pad)
+    eos_id = int(vocab.eos)
+    tokens_trim = []
+    for t in out_tokens:
+        tokens_trim.append(int(t))
+        if int(t) == eos_id:
+            break
+    if len(tokens_trim) == 0:
+        tokens_trim = [int(t) for t in out_tokens]
+
+    lp_cpu = log_prob_row.detach().to("cpu")
+    sel_mask = selected_token_mask_row.detach().to("cpu").bool()
+    n_tok = min(len(tokens_trim), int(lp_cpu.numel()))
+    valid_ids = torch.tensor(tokens_trim[:n_tok], dtype=torch.long)
+    valid_mask = (valid_ids != pad_id) & (valid_ids != eos_id)
+    chunk_conf = float(lp_cpu[:n_tok][valid_mask].mean().item()) if valid_mask.any() else float("-inf")
+    sel_valid_mask = sel_mask[:n_tok] & valid_mask
+
+    def _dist_stats(x: torch.Tensor):
+        if x.numel() == 0:
+            return {
+                "mean": float("nan"),
+                "p10": float("nan"),
+                "p50": float("nan"),
+                "p90": float("nan"),
+            }
+        x = x.float()
+        return {
+            "mean": float(x.mean().item()),
+            "p10": float(torch.quantile(x, 0.10).item()),
+            "p50": float(torch.quantile(x, 0.50).item()),
+            "p90": float(torch.quantile(x, 0.90).item()),
+        }
+
+    lp_all_stats = _dist_stats(lp_cpu[:n_tok][valid_mask])
+    lp_sel_stats = _dist_stats(lp_cpu[:n_tok][sel_valid_mask])
+    token_keep_ratio_row = float(sel_valid_mask.float().mean().item()) if valid_mask.any() else float("nan")
+
+    pseudo_events = _decode_pseudo_notes_with_token_indices(
+        out_tokens,
+        vocab,
+        step_ms=step_ms,
+        pad_id=pad_id,
+        eos_id=eos_id,
+    )
+    selected_events: List[PseudoNoteEvent] = []
+    for ev in pseudo_events:
+        on_sel = (0 <= int(ev.on_tok_idx) < sel_mask.numel()) and bool(sel_mask[int(ev.on_tok_idx)].item())
+        off_sel = (0 <= int(ev.off_tok_idx) < sel_mask.numel()) and bool(sel_mask[int(ev.off_tok_idx)].item())
+        if on_sel or off_sel:
+            selected_events.append(ev)
+
+    summary = {
+        "epoch": int(epoch),
+        "batch_idx": int(batch_idx),
+        "in_batch_idx": int(in_batch_idx),
+        "chunk_selected": bool(chunk_selected),
+        "chunk_conf_mean_logprob": float(chunk_conf),
+        "n_tokens": int(len(tokens_trim)),
+        "n_gt_notes": int(len(gt_intervals)),
+        "n_pseudo_notes_chunk": int(len(pseudo_events)),
+        "n_pseudo_notes_selected": int(len(selected_events)),
+        "selected_token_count": int(sel_mask.sum().item()),
+        "token_keep_ratio_row": float(token_keep_ratio_row),
+        "logprob_all_mean": lp_all_stats["mean"],
+        "logprob_all_p10": lp_all_stats["p10"],
+        "logprob_all_p50": lp_all_stats["p50"],
+        "logprob_all_p90": lp_all_stats["p90"],
+        "logprob_sel_mean": lp_sel_stats["mean"],
+        "logprob_sel_p10": lp_sel_stats["p10"],
+        "logprob_sel_p50": lp_sel_stats["p50"],
+        "logprob_sel_p90": lp_sel_stats["p90"],
+    }
+    if chunk_keep_ratio_batch is not None:
+        summary["chunk_keep_ratio_batch"] = float(chunk_keep_ratio_batch)
+    if token_keep_ratio_batch is not None:
+        summary["token_keep_ratio_batch"] = float(token_keep_ratio_batch)
+
+    with open(txt_path, "w", encoding="utf-8") as f:
+        f.write("# pseudo debug sample\n")
+        f.write(json.dumps(summary, ensure_ascii=False, indent=2))
+        f.write("\n\n# tokens\n")
+        f.write("token_ids=" + ",".join(str(int(t)) for t in tokens_trim) + "\n")
+        f.write("# selected token indices (y_tg positions)\n")
+        sel_idx = torch.where(sel_mask)[0].tolist()
+        f.write("selected_token_indices=" + ",".join(str(int(i)) for i in sel_idx) + "\n")
+        f.write("# pseudo notes (all)\n")
+        for i, ev in enumerate(pseudo_events):
+            f.write(
+                f"all[{i}] pitch={int(ev.pitch)} onset={float(ev.onset):.3f} offset={float(ev.offset):.3f} "
+                f"on_tok={int(ev.on_tok_idx)} off_tok={int(ev.off_tok_idx)}\n"
+            )
+        f.write("# pseudo notes (selected)\n")
+        for i, ev in enumerate(selected_events):
+            f.write(
+                f"sel[{i}] pitch={int(ev.pitch)} onset={float(ev.onset):.3f} offset={float(ev.offset):.3f} "
+                f"on_tok={int(ev.on_tok_idx)} off_tok={int(ev.off_tok_idx)}\n"
+            )
+        f.write("# gt notes (local chunk time)\n")
+        for i in range(len(gt_intervals)):
+            f.write(
+                f"gt[{i}] pitch={int(gt_pitches[i])} onset={float(gt_intervals[i, 0]):.3f} "
+                f"offset={float(gt_intervals[i, 1]):.3f}\n"
+            )
+
+    fig, ax = plt.subplots(figsize=(12, 4))
+
+    def _draw_bars(intervals: np.ndarray, pitches: np.ndarray, *, color: str, label: str, alpha: float):
+        first = True
+        for i in range(len(intervals)):
+            s = float(intervals[i, 0])
+            e = float(intervals[i, 1])
+            p = int(pitches[i])
+            w = max(0.01, e - s)
+            rect = Rectangle(
+                (s, p - 0.42),
+                w,
+                0.84,
+                facecolor=color,
+                edgecolor=color,
+                linewidth=0.8,
+                alpha=alpha,
+                label=(label if first else None),
+            )
+            ax.add_patch(rect)
+            first = False
+
+    if len(gt_intervals) > 0:
+        _draw_bars(gt_intervals, gt_pitches, color="tab:blue", label="GT MIDI", alpha=0.45)
+
+    if len(pseudo_events) > 0:
+        est_int = np.array([[ev.onset, ev.offset] for ev in pseudo_events], dtype=float)
+        est_pitch = np.array([ev.pitch for ev in pseudo_events], dtype=int)
+        _draw_bars(est_int, est_pitch, color="gray", label="Pseudo chunk notes", alpha=0.35)
+
+    if len(selected_events) > 0:
+        sel_int = np.array([[ev.onset, ev.offset] for ev in selected_events], dtype=float)
+        sel_pitch = np.array([ev.pitch for ev in selected_events], dtype=int)
+        _draw_bars(sel_int, sel_pitch, color="tab:red", label="Selected pseudo notes", alpha=0.85)
+
+    ax.set_xlim(0.0, max(0.1, float(window_sec)))
+    ax.set_ylim(20, 108)
+    ax.set_xlabel("Time (s, local chunk)")
+    ax.set_ylabel("MIDI pitch")
+    ax.set_title(
+        f"Pseudo Debug ep={epoch} batch={batch_idx} idx={in_batch_idx} "
+        f"(chunk_selected={int(chunk_selected)})"
+    )
+    ax.grid(True, axis="x", alpha=0.2)
+    ax.legend(loc="upper right")
+    fig.tight_layout()
+    fig.savefig(png_path, dpi=150)
+    plt.close(fig)
+
+
 def make_collate_real():
     def _collate(batch):
         # batch: List[(Tensor[T,F], int, int)]
@@ -532,6 +715,9 @@ def train_loop_distributed_DA_confusion(
     pseudo_note_onset_only: bool = False,
     pseudo_note_threshold: float = -0.5,
     pseudo_note_without_chunk: bool = False,
+    pseudo_debug_n: int = 0,
+    pseudo_debug_dir: str | None = None,
+    pseudo_debug_start_epoch: int = 0,  # deprecated: debug starts at pseudo_start_epoch
     # ---- Augmentation ----
     use_augment: bool = True,
     # ---- 既存 ----
@@ -646,7 +832,7 @@ def train_loop_distributed_DA_confusion(
     # ---- Oracle MIDI cache ----
     oracle_midi_cache: Dict[int, object] = {}
     _need_samples_for_oracle = 0
-    if oracle_filter and oracle_midi_paths is not None:
+    if (oracle_filter or int(pseudo_debug_n) > 0) and oracle_midi_paths is not None:
         import pretty_midi as _pm
         _need_samples_for_oracle = (input_frames - 1) * 256 + 2048
         if rank == 0:
@@ -670,6 +856,26 @@ def train_loop_distributed_DA_confusion(
         if pseudo_note_without_chunk:
             msg += " (without chunk filter)"
         print(msg)
+    pseudo_debug_written = 0
+    pseudo_debug_root = str(pseudo_debug_dir) if pseudo_debug_dir else os.path.join(save_dir, "pseudo_debug")
+    pseudo_metrics_csv = os.path.join(pseudo_debug_root, "pseudo_metrics.csv")
+    if rank == 0 and int(pseudo_debug_n) > 0:
+        os.makedirs(pseudo_debug_root, exist_ok=True)
+        print(f"[pseudo-debug] enabled: n={int(pseudo_debug_n)} dir={pseudo_debug_root}")
+        if not os.path.exists(pseudo_metrics_csv):
+            try:
+                import csv as _csv
+                with open(pseudo_metrics_csv, "w", newline="") as f:
+                    w = _csv.writer(f)
+                    w.writerow([
+                        "epoch", "batch_idx",
+                        "chunk_keep_ratio", "token_keep_ratio",
+                        "n_chunks", "n_tokens_valid", "n_tokens_selected",
+                        "logprob_all_mean", "logprob_all_p10", "logprob_all_p50", "logprob_all_p90",
+                        "logprob_sel_mean", "logprob_sel_p10", "logprob_sel_p50", "logprob_sel_p90",
+                    ])
+            except Exception as e:
+                print(f"[pseudo-debug] failed to init metrics csv: {e}")
 
     # ---- models ----
     model = MT3Mini(vocab_size=len(vocab.itos)).to(device)
@@ -809,7 +1015,7 @@ def train_loop_distributed_DA_confusion(
         if use_pseudo:
             fast_dec = FastDecoderKV(ema.teacher.dec, max_len=pseudo_max_len).to(device).eval()
 
-        for mels_s, y_in_s, y_tg_s in pbar:
+        for batch_idx, (mels_s, y_in_s, y_tg_s) in enumerate(pbar, start=1):
             mels_r, real_idxs, real_starts = (None, None, None)
             if real_iter is not None:
                 mels_r, real_idxs, real_starts = next(real_iter)
@@ -970,6 +1176,99 @@ def train_loop_distributed_DA_confusion(
                         kept_idxs = torch.where(chunk_mask)[0].tolist()
                         for b_idx in kept_idxs:
                             running_pseudo_notes += len(decode_notes_to_spans(out[b_idx].tolist(), vocab))
+
+                    selected_token_mask = (y_tg_masked != pad_id)
+                    lp_len = int(log_prob.size(1))
+                    valid_lp_mask = (out[:, :lp_len] != pad_id) & (out[:, :lp_len] != eos_id)
+                    selected_lp_mask = selected_token_mask[:, :lp_len] & valid_lp_mask
+                    chunk_keep_ratio = float(chunk_mask.float().mean().item())
+                    token_keep_ratio = float(selected_lp_mask.float().mean().item())
+
+                    lp_all = log_prob[valid_lp_mask]
+                    lp_sel = log_prob[selected_lp_mask]
+
+                    def _batch_lp_stats(x: torch.Tensor):
+                        if x.numel() == 0:
+                            return (float("nan"), float("nan"), float("nan"), float("nan"))
+                        x = x.float()
+                        return (
+                            float(x.mean().item()),
+                            float(torch.quantile(x, 0.10).item()),
+                            float(torch.quantile(x, 0.50).item()),
+                            float(torch.quantile(x, 0.90).item()),
+                        )
+
+                    all_mean, all_p10, all_p50, all_p90 = _batch_lp_stats(lp_all)
+                    sel_mean, sel_p10, sel_p50, sel_p90 = _batch_lp_stats(lp_sel)
+
+                    if rank == 0 and int(pseudo_debug_n) > 0:
+                        try:
+                            import csv as _csv
+                            with open(pseudo_metrics_csv, "a", newline="") as f:
+                                w = _csv.writer(f)
+                                w.writerow([
+                                    int(ep + 1), int(batch_idx),
+                                    f"{chunk_keep_ratio:.6f}", f"{token_keep_ratio:.6f}",
+                                    int(chunk_mask.numel()), int(valid_lp_mask.sum().item()), int(selected_lp_mask.sum().item()),
+                                    f"{all_mean:.6f}", f"{all_p10:.6f}", f"{all_p50:.6f}", f"{all_p90:.6f}",
+                                    f"{sel_mean:.6f}", f"{sel_p10:.6f}", f"{sel_p50:.6f}", f"{sel_p90:.6f}",
+                                ])
+                        except Exception as e:
+                            print(f"[pseudo-debug] failed to append metrics: {e}")
+
+                    dbg_active = (rank == 0) and (int(pseudo_debug_n) > 0) and (pseudo_debug_written < int(pseudo_debug_n))
+                    if dbg_active:
+                        ep1 = int(ep + 1)
+                        if ep1 < int(pseudo_start_epoch):
+                            dbg_active = False
+
+                    if dbg_active and real_idxs is not None and real_starts is not None:
+                        try:
+                            from my_mt3.eval import extract_notes_in_range
+                            epoch_debug_root = os.path.join(pseudo_debug_root, f"ep_{ep1:05d}")
+                            window_sec_dbg = (
+                                _need_samples_for_oracle / float(sr)
+                                if _need_samples_for_oracle > 0
+                                else (((input_frames - 1) * 256 + 2048) / float(sr))
+                            )
+                            kept_idxs = torch.where(chunk_mask)[0].tolist()
+                            if not kept_idxs:
+                                kept_idxs = torch.where(selected_token_mask.any(dim=1))[0].tolist()
+                            for b_idx in kept_idxs:
+                                if pseudo_debug_written >= int(pseudo_debug_n):
+                                    break
+                                idx = int(real_idxs[b_idx].item())
+                                ss = int(real_starts[b_idx].item())
+                                t0 = ss / float(sr)
+                                t1 = t0 + window_sec_dbg
+                                ref_pm = oracle_midi_cache.get(idx)
+                                if ref_pm is not None:
+                                    gt_int, gt_pitch, _ = extract_notes_in_range(ref_pm, t0, t1, program=0)
+                                else:
+                                    gt_int = np.zeros((0, 2), dtype=float)
+                                    gt_pitch = np.zeros((0,), dtype=int)
+                                _save_pseudo_debug_sample(
+                                    out_tokens=out[b_idx].tolist(),
+                                    log_prob_row=log_prob[b_idx],
+                                    selected_token_mask_row=selected_token_mask[b_idx],
+                                    chunk_selected=bool(chunk_mask[b_idx].item()),
+                                    save_root=epoch_debug_root,
+                                    sample_idx=pseudo_debug_written + 1,
+                                    epoch=ep1,
+                                    batch_idx=batch_idx,
+                                    in_batch_idx=int(b_idx),
+                                    vocab=vocab,
+                                    gt_intervals=gt_int,
+                                    gt_pitches=gt_pitch,
+                                    window_sec=float(window_sec_dbg),
+                                    step_ms=10,
+                                    chunk_keep_ratio_batch=chunk_keep_ratio,
+                                    token_keep_ratio_batch=token_keep_ratio,
+                                )
+                                pseudo_debug_written += 1
+                        except Exception as e:
+                            if rank == 0:
+                                print(f"[pseudo-debug] skip due to error: {e}")
 
                     # teacher: clean mel (used in pseudo_label_with_kvcache above)
                     # student: augmented mel for consistency regularization

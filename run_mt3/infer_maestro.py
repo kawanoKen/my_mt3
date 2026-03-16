@@ -311,6 +311,8 @@ def main():
     ap.add_argument("--offset_ratio", type=float, default=0.2, help="offset ratio (None to use fixed tolerance)")
     ap.add_argument("--offset_min_tolerance", type=float, default=0.05, help="minimum offset tolerance in seconds")
     ap.add_argument("--max_songs", type=int, default=0, help="limit number of songs to process (0=all)")
+    ap.add_argument("--skip_existing", action="store_true",
+                    help="skip inference if output .pred.mid already exists (resume-friendly)")
     ap.add_argument("--save_confidence", action="store_true",
                      help="save per-chunk confidence (log_pyx) to chunk_confidence.csv")
     args = ap.parse_args()
@@ -405,6 +407,7 @@ def main():
 
     eval_rows = []
     conf_all_rows = []
+    n_skipped = 0
 
     for audio_path, midi_path, pid in tqdm(pairs, desc=f"infer {split_label}", unit="song"):
         a_path = audio_path
@@ -413,6 +416,23 @@ def main():
 
         stem = Path(audio_path).stem
         out_mid = out_dir / f"{stem}.pred.mid"
+
+        if args.skip_existing and out_mid.exists():
+            n_skipped += 1
+            if args.eval:
+                try:
+                    m = evaluate_midi_pair(
+                        midi_path, str(out_mid),
+                        onset_tolerance=args.onset_tolerance,
+                        offset_ratio=args.offset_ratio,
+                        offset_min_tolerance=args.offset_min_tolerance,
+                        program=pid,
+                    )
+                    m["stem"] = stem
+                    eval_rows.append(m)
+                except Exception as e:
+                    print(f"[eval skip] {stem}: {e}")
+            continue
 
         result = infer_one_song_piano(
             model,
@@ -453,6 +473,8 @@ def main():
             except Exception as e:
                 print(f"[eval skip] {stem}: {e}")
 
+    if args.skip_existing:
+        print(f"skipped existing files: {n_skipped}")
     print(f"done -> {out_dir}")
 
     if args.save_confidence and conf_all_rows:

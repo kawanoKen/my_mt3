@@ -645,8 +645,41 @@ def make_collate_real():
         return mels_padded, idxs, starts
     return _collate
 
+def _pm_to_note_arrays(pm) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    intervals: List[List[float]] = []
+    pitches: List[int] = []
+    velocities: List[int] = []
+    for inst in pm.instruments:
+        if inst.is_drum:
+            continue
+        for n in inst.notes:
+            intervals.append([float(n.start), float(n.end)])
+            pitches.append(int(n.pitch))
+            velocities.append(int(n.velocity))
+    if len(intervals) == 0:
+        return (
+            np.zeros((0, 2), dtype=float),
+            np.zeros((0,), dtype=int),
+            np.zeros((0,), dtype=int),
+        )
+    arr_i = np.asarray(intervals, dtype=float)
+    arr_p = np.asarray(pitches, dtype=int)
+    arr_v = np.asarray(velocities, dtype=int)
+    order = np.argsort(arr_i[:, 0])
+    return arr_i[order], arr_p[order], arr_v[order]
+
+
 @torch.no_grad()
-def eval_loop_ddp(model_ddp, dl, crit, device, *, compute_token_acc: bool = False):
+def eval_loop_ddp(
+    model_ddp,
+    dl,
+    crit,
+    device,
+    *,
+    compute_token_acc: bool = False,
+    compute_mir_eval: bool = False,
+    vocab: Optional[Vocab] = None,
+):
     """
     全rankで val を回し、loss を global average する
     """
@@ -656,6 +689,18 @@ def eval_loop_ddp(model_ddp, dl, crit, device, *, compute_token_acc: bool = Fals
     token_correct = torch.zeros(1, device=device)
     token_count = torch.zeros(1, device=device)
     pad_id = int(crit.ignore_index)
+
+    mir_onset_f_sum = torch.zeros(1, device=device)
+    mir_onset_pitch_f_sum = torch.zeros(1, device=device)
+    mir_note_f_sum = torch.zeros(1, device=device)
+    mir_note_vel_f_sum = torch.zeros(1, device=device)
+    mir_count = torch.zeros(1, device=device)
+
+    if compute_mir_eval:
+        if vocab is None:
+            raise ValueError("vocab must be provided when compute_mir_eval=True")
+        from my_mt3.eval import evaluate_notes_direct
+        from my_mt3.infer import to_midi_from_tokens_piano
 
     for mels, y_in, y_tg in dl:
         mels, y_in, y_tg = mels.to(device, non_blocking=True), y_in.to(device, non_blocking=True), y_tg.to(device, non_blocking=True)
@@ -668,6 +713,33 @@ def eval_loop_ddp(model_ddp, dl, crit, device, *, compute_token_acc: bool = Fals
             valid = (y_tg != pad_id)
             token_correct += ((pred == y_tg) & valid).sum()
             token_count += valid.sum()
+        if compute_mir_eval:
+            pred = logits.argmax(dim=-1)
+            for b in range(y_tg.size(0)):
+                valid_b = (y_tg[b] != pad_id)
+                if int(valid_b.sum().item()) == 0:
+                    continue
+                first_tok = int(y_in[b, 0].item())
+                if first_tok == pad_id:
+                    continue
+                gt_seq = [first_tok] + y_tg[b][valid_b].tolist()
+                est_seq = [first_tok] + pred[b][valid_b].tolist()
+                pm_gt = to_midi_from_tokens_piano(gt_seq, program_id=0, step_ms=10, vocab=vocab).pm
+                pm_est = to_midi_from_tokens_piano(est_seq, program_id=0, step_ms=10, vocab=vocab).pm
+                gt_int, gt_pitch, gt_vel = _pm_to_note_arrays(pm_gt)
+                est_int, est_pitch, est_vel = _pm_to_note_arrays(pm_est)
+                try:
+                    met = evaluate_notes_direct(
+                        gt_int, gt_pitch, gt_vel,
+                        est_int, est_pitch, est_vel,
+                    )
+                except Exception:
+                    continue
+                mir_onset_f_sum += float(met.get("onset_f", 0.0))
+                mir_onset_pitch_f_sum += float(met.get("onset_pitch_f", 0.0))
+                mir_note_f_sum += float(met.get("note_f", 0.0))
+                mir_note_vel_f_sum += float(met.get("note_vel_f", 0.0))
+                mir_count += 1.0
 
     # allreduce
     dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
@@ -675,10 +747,28 @@ def eval_loop_ddp(model_ddp, dl, crit, device, *, compute_token_acc: bool = Fals
     if compute_token_acc:
         dist.all_reduce(token_correct, op=dist.ReduceOp.SUM)
         dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
+    if compute_mir_eval:
+        dist.all_reduce(mir_onset_f_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(mir_onset_pitch_f_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(mir_note_f_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(mir_note_vel_f_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(mir_count, op=dist.ReduceOp.SUM)
 
     val_loss = (total_loss / torch.clamp(n_batches, min=1)).item()
     val_token_acc = (token_correct / torch.clamp(token_count, min=1)).item() if compute_token_acc else 0.0
-    return {"val_loss": float(val_loss), "val_token_acc": float(val_token_acc)}
+    denom = torch.clamp(mir_count, min=1.0)
+    val_onset_f = (mir_onset_f_sum / denom).item() if compute_mir_eval else 0.0
+    val_onset_pitch_f = (mir_onset_pitch_f_sum / denom).item() if compute_mir_eval else 0.0
+    val_note_f = (mir_note_f_sum / denom).item() if compute_mir_eval else 0.0
+    val_note_vel_f = (mir_note_vel_f_sum / denom).item() if compute_mir_eval else 0.0
+    return {
+        "val_loss": float(val_loss),
+        "val_token_acc": float(val_token_acc),
+        "val_onset_f": float(val_onset_f),
+        "val_onset_pitch_f": float(val_onset_pitch_f),
+        "val_note_f": float(val_note_f),
+        "val_note_vel_f": float(val_note_vel_f),
+    }
 
 
 def train_loop_distributed_DA_confusion(
@@ -726,6 +816,7 @@ def train_loop_distributed_DA_confusion(
     input_frames: int = INPUT_FRAMES,
     lr_warmup_epochs: int = 0,
     lr_min_ratio: float = 0.1,
+    val_every: int = 2000,
     save_every=10,
     save_dir="checkpoints",
     use_cache: bool = True,
@@ -936,7 +1027,8 @@ def train_loop_distributed_DA_confusion(
                 if mode == "w":
                     w.writerow([
                         "epoch", "train_total", "train_sup", "train_adv", "train_unsup", "train_disc", "val_loss",
-                        "val_token_acc", "pseudo_chunks", "pseudo_notes"
+                        "val_token_acc", "val_onset_f", "val_onset_pitch_f", "val_note_f", "val_note_vel_f",
+                        "pseudo_chunks", "pseudo_notes"
                     ])
         except Exception:
             pass
@@ -1317,16 +1409,26 @@ def train_loop_distributed_DA_confusion(
         # ---- val (optional) ----
         val_loss = 0.0
         val_token_acc = 0.0
-        if (ep + 1) % 10 == 0 or (ep + 1) == epochs:
+        val_onset_f = 0.0
+        val_onset_pitch_f = 0.0
+        val_note_f = 0.0
+        val_note_vel_f = 0.0
+        if (ep + 1) % int(val_every) == 0 or (ep + 1) == epochs:
             val_metrics = eval_loop_ddp(
                 model_ddp,
                 val_dl,
                 crit_ce,
                 device,
                 compute_token_acc=((ep + 1) == epochs),
+                compute_mir_eval=True,
+                vocab=vocab,
             )
             val_loss = float(val_metrics["val_loss"])
             val_token_acc = float(val_metrics["val_token_acc"])
+            val_onset_f = float(val_metrics["val_onset_f"])
+            val_onset_pitch_f = float(val_metrics["val_onset_pitch_f"])
+            val_note_f = float(val_metrics["val_note_f"])
+            val_note_vel_f = float(val_metrics["val_note_vel_f"])
 
         if rank == 0:
             denom = max(1, n_batches)
@@ -1337,7 +1439,9 @@ def train_loop_distributed_DA_confusion(
             avg_disc = running_disc / denom
             print(
                 f"[epoch {ep+1}] train_loss={avg_total:.3f} | "
-                f"val_loss={val_loss:.3f} | val_token_acc={val_token_acc:.4f}"
+                f"val_loss={val_loss:.3f} | val_token_acc={val_token_acc:.4f} | "
+                f"onset_f={val_onset_f:.4f} | onset_pitch_f={val_onset_pitch_f:.4f} | "
+                f"note_f={val_note_f:.4f} | note_vel_f={val_note_vel_f:.4f}"
             )
             # CSVへ追記
             try:
@@ -1347,6 +1451,7 @@ def train_loop_distributed_DA_confusion(
                     w.writerow([
                         ep+1, f"{avg_total:.6f}", f"{avg_sup:.6f}", f"{avg_adv:.6f}", f"{avg_unsup:.6f}",
                         f"{avg_disc:.6f}", f"{val_loss:.6f}", f"{val_token_acc:.6f}",
+                        f"{val_onset_f:.6f}", f"{val_onset_pitch_f:.6f}", f"{val_note_f:.6f}", f"{val_note_vel_f:.6f}",
                         running_pseudo_chunks, running_pseudo_notes
                     ])
             except Exception:

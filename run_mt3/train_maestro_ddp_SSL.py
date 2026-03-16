@@ -305,7 +305,7 @@ if __name__ == "__main__":
     ap.add_argument("--pseudo_start_epoch", type=int, default=1000,
                      help="start pseudo-label training from this epoch")
     ap.add_argument("--ema_decay", type=float, default=0.999)
-    ap.add_argument("--unsup_weight", type=float, default=1.0,
+    ap.add_argument("--unsup_weight", type=float, default=0.6,
                      help="weight for unsupervised pseudo-label loss")
     ap.add_argument("--pseudo_max_len", type=int, default=1024)
     ap.add_argument("--pseudo_threshold", type=float, default=-0.5,
@@ -350,6 +350,8 @@ if __name__ == "__main__":
 
     # Saving
     ap.add_argument("--save-every", type=int, default=100)
+    ap.add_argument("--val-every", type=int, default=2000,
+                     help="run validation (incl. mir_eval metrics) every N epochs")
     ap.add_argument("--save-dir", type=str, default=None)
 
     # Cache
@@ -541,6 +543,7 @@ if __name__ == "__main__":
         input_frames=args.input_frames,
         lr_warmup_epochs=args.lr_warmup_epochs,
         lr_min_ratio=args.lr_min_ratio,
+        val_every=args.val_every,
         save_every=args.save_every,
         save_dir=save_dir,
         use_cache=False,

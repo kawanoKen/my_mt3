@@ -29,6 +29,7 @@ import numpy as np
 import pandas as pd
 import pretty_midi
 import torch
+import mir_eval
 from tqdm import tqdm
 import matplotlib
 matplotlib.use("Agg")
@@ -290,6 +291,160 @@ def _parse_token_events(token_ids, lps, vocab, step_ms: int):
     return events
 
 
+def _parse_onset_and_note_units(token_ids, lps, vocab, step_ms: int):
+    """
+    Parse generated sequence into:
+      - onset units: confidence = logp(TIME_on) + logp(NON)
+      - note units : confidence = logp(TIME_on) + logp(NON) + logp(TIME_off) + logp(NOF)
+    """
+    eos_id = int(vocab.eos)
+    id2on = {tid: p for p, tid in vocab.note_on.items()}
+    id2off = {}
+    if vocab.note_off is not None:
+        id2off = {tid: p for p, tid in vocab.note_off.items()}
+    id2time = {tid: t for t, tid in vocab.time.items()}
+
+    cur_step = 0
+    cur_time_logp = 0.0
+    open_on: dict[int, list[dict]] = {}
+    onset_units = []
+    note_units = []
+
+    for i, tid in enumerate(token_ids):
+        tid = int(tid)
+        if tid == eos_id:
+            break
+        lp = float(lps[i]) if i < len(lps) else 0.0
+
+        if tid in id2time:
+            cur_step = int(id2time[tid])
+            cur_time_logp = lp
+            continue
+
+        if tid in id2on:
+            p = int(id2on[tid])
+            t_sec = (cur_step * int(step_ms)) / 1000.0
+            onset_conf = cur_time_logp + lp
+            on_info = {
+                "pitch": p,
+                "onset_sec": t_sec,
+                "offset_sec": np.nan,
+                "time_on_logp": float(cur_time_logp),
+                "on_logp": float(lp),
+                "time_off_logp": np.nan,
+                "off_logp": np.nan,
+                "conf_sum": float(onset_conf),
+                "conf_norm": float(onset_conf / 2.0),
+            }
+            onset_units.append(on_info)
+            open_on.setdefault(p, []).append(on_info)
+            continue
+
+        if tid in id2off:
+            p = int(id2off[tid])
+            if p not in open_on or len(open_on[p]) == 0:
+                continue
+            on_info = open_on[p].pop(0)
+            off_sec = (cur_step * int(step_ms)) / 1000.0
+            note_conf = on_info["time_on_logp"] + on_info["on_logp"] + cur_time_logp + lp
+            note_units.append({
+                "pitch": p,
+                "onset_sec": float(on_info["onset_sec"]),
+                "offset_sec": float(max(off_sec, float(on_info["onset_sec"]) + 1e-3)),
+                "time_on_logp": float(on_info["time_on_logp"]),
+                "on_logp": float(on_info["on_logp"]),
+                "time_off_logp": float(cur_time_logp),
+                "off_logp": float(lp),
+                "conf_sum": float(note_conf),
+                "conf_norm": float(note_conf / 4.0),
+            })
+
+    return onset_units, note_units
+
+
+def _matched_pred_indices(ref_times, pred_times, tol: float) -> set[int]:
+    if len(ref_times) == 0 or len(pred_times) == 0:
+        return set()
+    matched = mir_eval.util.match_events(ref_times, pred_times, window=tol)
+    if isinstance(matched, tuple) and len(matched) == 2:
+        return {int(i) for i in matched[1]}
+    return {int(j) for _, j in matched}
+
+
+def _match_onsets_mireval_style(
+    onset_units,
+    ref_int, ref_pitch,
+    *,
+    onset_tol: float = 0.05,
+):
+    if len(onset_units) == 0:
+        return []
+    if len(ref_int) == 0:
+        return [False] * len(onset_units)
+
+    flags = np.zeros((len(onset_units),), dtype=bool)
+    pred_pitch = np.asarray([int(u["pitch"]) for u in onset_units], dtype=int)
+    pred_on = np.asarray([float(u["onset_sec"]) for u in onset_units], dtype=float)
+    ref_on = ref_int[:, 0]
+
+    for p in np.unique(pred_pitch):
+        pm = pred_pitch == p
+        pred_on_p = pred_on[pm]
+        pred_local_idx = np.where(pm)[0]
+        ref_on_p = ref_on[ref_pitch == p]
+        matched_pred = _matched_pred_indices(ref_on_p, pred_on_p, onset_tol)
+        for j in matched_pred:
+            flags[pred_local_idx[j]] = True
+
+    return [bool(v) for v in flags]
+
+
+def _match_notes_mireval_style(
+    note_units,
+    ref_int, ref_pitch,
+    *,
+    onset_tolerance: float = 0.05,
+    offset_ratio: float = 0.2,
+    offset_min_tolerance: float = 0.05,
+):
+    """One-to-one matching per pitch with onset/offset tolerances (mir_eval style)."""
+    if len(note_units) == 0 or len(ref_int) == 0:
+        return []
+
+    ref_by_pitch = {}
+    for i, p in enumerate(ref_pitch.tolist()):
+        ref_by_pitch.setdefault(int(p), []).append(i)
+    for p in ref_by_pitch.keys():
+        ref_by_pitch[p].sort(key=lambda idx: float(ref_int[idx, 0]))
+
+    used_ref = set()
+    matched_est_idx = []
+    for i_est, e in enumerate(note_units):
+        cand = ref_by_pitch.get(int(e["pitch"]), [])
+        if not cand:
+            continue
+        best_idx = -1
+        best_score = float("inf")
+        for r_idx in cand:
+            if r_idx in used_ref:
+                continue
+            r_on = float(ref_int[r_idx, 0])
+            r_off = float(ref_int[r_idx, 1])
+            if abs(float(e["onset_sec"]) - r_on) > onset_tolerance:
+                continue
+            off_tol = max(offset_min_tolerance, offset_ratio * max(r_off - r_on, 1e-6))
+            if abs(float(e["offset_sec"]) - r_off) > off_tol:
+                continue
+            score = abs(float(e["onset_sec"]) - r_on) + abs(float(e["offset_sec"]) - r_off)
+            if score < best_score:
+                best_score = score
+                best_idx = r_idx
+        if best_idx >= 0:
+            used_ref.add(best_idx)
+            matched_est_idx.append(i_est)
+    return matched_est_idx
+
+
 def _match_events_to_ref(
     token_events,
     ref_int, ref_pitch,
@@ -386,6 +541,62 @@ def plot_token_confidence_boxplots(token_rows: list, out_dir: Path) -> None:
     csv_path = out_dir / "token_confidence.csv"
     df.to_csv(csv_path, index=False)
     print(f"Token confidence CSV -> {csv_path}  ({len(df)} tokens)")
+
+
+def plot_note_unit_confidence_boxplots(note_unit_rows: list, out_dir: Path) -> None:
+    """Box plots for onset-note-unit confidence split by correctness."""
+    df = pd.DataFrame(note_unit_rows)
+    if df.empty:
+        print("No note-unit data for box plots.")
+        return
+
+    configs = [
+        ("onset_sum", "Onset unit confidence (time+on)", "onset", "conf_sum"),
+        ("onset_norm", "Onset unit confidence norm ((time+on)/2)", "onset", "conf_norm"),
+        ("note_sum", "Note unit confidence (time_on+on+time_off+off)", "note", "conf_sum"),
+        ("note_norm", "Note unit confidence norm (/4)", "note", "conf_norm"),
+    ]
+
+    for suffix, title, unit_type, conf_col in configs:
+        sub = df[df["unit_type"] == unit_type]
+        if sub.empty:
+            continue
+        groups = [
+            sub.loc[sub["correct"], conf_col].values,
+            sub.loc[~sub["correct"], conf_col].values,
+        ]
+        labels = [
+            f"Correct (n={len(groups[0])})",
+            f"Incorrect (n={len(groups[1])})",
+        ]
+        colors = ["#4c94d6", "#e06060"]
+
+        fig, ax = plt.subplots(figsize=(6, 5))
+        bp = ax.boxplot(
+            groups, labels=labels, patch_artist=True,
+            widths=0.5, showfliers=True,
+            flierprops=dict(marker=".", markersize=2, alpha=0.3),
+        )
+        for patch, color in zip(bp["boxes"], colors):
+            patch.set_facecolor(color)
+            patch.set_alpha(0.7)
+        for median in bp["medians"]:
+            median.set_color("black")
+            median.set_linewidth(1.5)
+
+        ax.set_ylabel(conf_col)
+        ax.set_title(title)
+        ax.grid(axis="y", alpha=0.3)
+
+        fig.tight_layout()
+        fig_path = out_dir / f"note_unit_confidence_boxplot_{suffix}.png"
+        fig.savefig(fig_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"Note-unit box plot saved -> {fig_path}")
+
+    csv_path = out_dir / "note_unit_confidence.csv"
+    df.to_csv(csv_path, index=False)
+    print(f"Note-unit confidence CSV -> {csv_path}  ({len(df)} rows)")
 
 
 # ──────────────────────────────────────────────────────────────
@@ -514,6 +725,7 @@ def run_from_scratch(args):
 
     rows = []
     token_rows = []
+    note_unit_rows = []
 
     for song_idx, (audio_path, midi_path, pid) in enumerate(tqdm(pairs, desc="songs")):
         stem = Path(audio_path).stem
@@ -617,6 +829,34 @@ def run_from_scratch(args):
                         "correct": c,
                     })
 
+                onset_units, note_units = _parse_onset_and_note_units(
+                    token_ids, lps, vocab, step_ms=args.step_ms
+                )
+                onset_flags = _match_onsets_mireval_style(
+                    onset_units, ref_int, ref_pitch, onset_tol=0.05
+                )
+                note_match_idx = set(_match_notes_mireval_style(
+                    note_units, ref_int, ref_pitch,
+                    onset_tolerance=0.05, offset_ratio=0.2, offset_min_tolerance=0.05,
+                ))
+
+                for u, c in zip(onset_units, onset_flags):
+                    note_unit_rows.append({
+                        "stem": stem,
+                        "chunk_idx": chunk_idx,
+                        "unit_type": "onset",
+                        **u,
+                        "correct": bool(c),
+                    })
+                for i_u, u in enumerate(note_units):
+                    note_unit_rows.append({
+                        "stem": stem,
+                        "chunk_idx": chunk_idx,
+                        "unit_type": "note",
+                        **u,
+                        "correct": bool(i_u in note_match_idx),
+                    })
+
     df = pd.DataFrame(rows)
     csv_path = out_dir / "chunk_confidence_metrics.csv"
     df.to_csv(csv_path, index=False)
@@ -630,6 +870,8 @@ def run_from_scratch(args):
 
     if token_rows:
         plot_token_confidence_boxplots(token_rows, out_dir)
+    if note_unit_rows:
+        plot_note_unit_confidence_boxplots(note_unit_rows, out_dir)
 
     if args.piano_roll_n != 0 and args.pred_dir:
         generate_piano_rolls(

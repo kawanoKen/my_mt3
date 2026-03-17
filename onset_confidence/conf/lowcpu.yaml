@@ -1,0 +1,28 @@
+build:
+  ckpt: "checkpoints_maestro_SSL/run_20260309_234658_frac10pct/model_ep2300.pt"
+  root: "dataset/maestro-v3.0.0"
+  split: "validation"
+  out_csv: "outputs/onset_confidence_phase123/onset_records.csv"
+  max_songs: 3
+  max_chunks_per_song: 0
+  max_len: 512
+  step_ms: 10
+  hard_neg_topk: 5
+  beam_size: 3
+  sample_n: 3
+  sample_temperature: 1.0
+  sample_topk: 0
+  device: "cuda"
+  seed: 42
+
+evaluate:
+  input_csv: "outputs/onset_confidence_phase123/onset_records.csv"
+  out_dir: "outputs/onset_confidence_phase123/eval"
+  score_columns:
+    - "score_tf_local"
+    - "score_greedy_local"
+    - "score_beam_marginal"
+    - "score_sample_marginal"
+    - "score_same_time_marginal"
+    - "score_maxprob"
+    - "score_margin"

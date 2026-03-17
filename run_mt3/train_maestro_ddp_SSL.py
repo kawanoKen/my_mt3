@@ -350,7 +350,7 @@ if __name__ == "__main__":
 
     # Saving
     ap.add_argument("--save-every", type=int, default=100)
-    ap.add_argument("--val-every", type=int, default=2000,
+    ap.add_argument("--val-every", type=int, default=100,
                      help="run validation (incl. mir_eval metrics) every N epochs")
     ap.add_argument("--save-dir", type=str, default=None)
 

@@ -380,6 +380,112 @@ def pseudo_chunk_filter(
     return mask
 
 
+def _canonicalize_pseudo_sequence_tokens(
+    tokens: List[int],
+    logps: List[float],
+    *,
+    vocab: Vocab,
+    pad_id: int,
+    eos_id: int,
+) -> tuple[List[int], List[float]]:
+    """
+    Canonicalize pseudo token order within each TIME group:
+      1) same TIME: note_on pitch low->high
+      2) then note_off pitch low->high
+      3) remove duplicate token ids in the same TIME group (keep highest logp)
+    """
+    id2time: Dict[int, int] = {tid: t for t, tid in vocab.time.items()}
+    id2on: Dict[int, int] = {tid: p for p, tid in vocab.note_on.items()}
+    id2off: Dict[int, int] = {}
+    if getattr(vocab, "note_off", None) is not None:
+        id2off = {tid: p for p, tid in vocab.note_off.items()}
+
+    out_toks: List[int] = []
+    out_lps: List[float] = []
+    group_items: List[Tuple[int, float, int, int, int]] = []
+    # item: (tid, lp, type_ord, pitch, orig_idx)
+    in_time_group = False
+
+    def _flush_group() -> None:
+        nonlocal group_items, out_toks, out_lps
+        if not group_items:
+            return
+        # dedup by token id (keep max logp)
+        best_by_tid: Dict[int, Tuple[int, float, int, int, int]] = {}
+        for item in group_items:
+            tid, lp, type_ord, pitch, orig_idx = item
+            prev = best_by_tid.get(int(tid))
+            if prev is None or float(lp) > float(prev[1]):
+                best_by_tid[int(tid)] = item
+        items = list(best_by_tid.values())
+        items.sort(key=lambda x: (int(x[2]), int(x[3]), int(x[4])))
+        for tid, lp, *_ in items:
+            out_toks.append(int(tid))
+            out_lps.append(float(lp))
+        group_items = []
+
+    for i, tid in enumerate(tokens):
+        tid = int(tid)
+        lp = float(logps[i]) if i < len(logps) else 0.0
+        if tid == pad_id:
+            break
+        if tid == eos_id:
+            _flush_group()
+            out_toks.append(int(tid))
+            out_lps.append(float(lp))
+            break
+        if tid in id2time:
+            _flush_group()
+            out_toks.append(int(tid))
+            out_lps.append(float(lp))
+            in_time_group = True
+            continue
+
+        if in_time_group and (tid in id2on):
+            group_items.append((int(tid), float(lp), 0, int(id2on[tid]), int(i)))
+            continue
+        if in_time_group and (tid in id2off):
+            group_items.append((int(tid), float(lp), 1, int(id2off[tid]), int(i)))
+            continue
+
+        # non note token: keep relative order after on/off in this TIME group
+        if in_time_group:
+            group_items.append((int(tid), float(lp), 2, 10**9, int(i)))
+        else:
+            out_toks.append(int(tid))
+            out_lps.append(float(lp))
+
+    _flush_group()
+    return out_toks, out_lps
+
+
+def canonicalize_pseudo_batch_order(
+    out: torch.Tensor,
+    log_prob: torch.Tensor,
+    *,
+    vocab: Vocab,
+    pad_id: int,
+    eos_id: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply canonical ordering to each pseudo-labeled sequence in a batch."""
+    B, S = out.shape
+    out_new = torch.full_like(out, pad_id)
+    lp_new = torch.zeros_like(log_prob)
+
+    for b in range(B):
+        toks = [int(t) for t in out[b].tolist()]
+        lps = [float(x) for x in log_prob[b].tolist()]
+        toks_c, lps_c = _canonicalize_pseudo_sequence_tokens(
+            toks, lps, vocab=vocab, pad_id=pad_id, eos_id=eos_id
+        )
+        n = min(S, len(toks_c))
+        if n > 0:
+            out_new[b, :n] = torch.tensor(toks_c[:n], dtype=out.dtype, device=out.device)
+            lp_new[b, :n] = torch.tensor(lps_c[:n], dtype=log_prob.dtype, device=log_prob.device)
+
+    return out_new, lp_new
+
+
 def oracle_chunk_filter(
     out: torch.Tensor,
     real_idxs: torch.Tensor,
@@ -805,6 +911,7 @@ def train_loop_distributed_DA_confusion(
     pseudo_note_onset_only: bool = False,
     pseudo_note_threshold: float = -0.5,
     pseudo_note_without_chunk: bool = False,
+    pseudo_repair_order: bool = False,
     pseudo_debug_n: int = 0,
     pseudo_debug_dir: str | None = None,
     pseudo_debug_start_epoch: int = 0,  # deprecated: debug starts at pseudo_start_epoch
@@ -947,6 +1054,8 @@ def train_loop_distributed_DA_confusion(
         if pseudo_note_without_chunk:
             msg += " (without chunk filter)"
         print(msg)
+    if rank == 0 and pseudo_repair_order:
+        print("[pseudo-note] order-repair enabled: same-time pitch low->high, on->off, dedup same token")
     pseudo_debug_written = 0
     pseudo_debug_root = str(pseudo_debug_dir) if pseudo_debug_dir else os.path.join(save_dir, "pseudo_debug")
     pseudo_metrics_csv = os.path.join(pseudo_debug_root, "pseudo_metrics.csv")
@@ -1163,6 +1272,14 @@ def train_loop_distributed_DA_confusion(
                     max_new_tokens=pseudo_max_len,
                     return_with_prefix=False,
                 )
+                if pseudo_repair_order:
+                    out, log_prob = canonicalize_pseudo_batch_order(
+                        out,
+                        log_prob,
+                        vocab=vocab,
+                        pad_id=int(vocab.pad),
+                        eos_id=int(vocab.eos),
+                    )
 
                 B = out.size(0)
                 prg_id = int(vocab.instrument_type["PRG_0"])

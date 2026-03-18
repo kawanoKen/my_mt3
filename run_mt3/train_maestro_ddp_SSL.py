@@ -308,19 +308,21 @@ if __name__ == "__main__":
     ap.add_argument("--unsup_weight", type=float, default=0.6,
                      help="weight for unsupervised pseudo-label loss")
     ap.add_argument("--pseudo_max_len", type=int, default=1024)
-    ap.add_argument("--pseudo_threshold", type=float, default=-0.5,
+    ap.add_argument("--pseudo_threshold", type=float, default=-1.1,
                      help="chunk-level mean log-prob threshold for pseudo-label (used when pseudo_topn=0)")
     ap.add_argument("--pseudo_topn", type=int, default=0,
                      help="select top-N most confident chunks per batch as pseudo-labels "
                           "(0=use threshold mode instead)")
     ap.add_argument("--pseudo_note_target_only", action="store_true",
                      help="compute unsupervised loss only on pseudo note tokens filtered by note confidence")
-    ap.add_argument("--pseudo_note_threshold", type=float, default=-0.5,
+    ap.add_argument("--pseudo_note_threshold", type=float, default=-0.6,
                      help="minimum note-level confidence to keep pseudo note tokens")
     ap.add_argument("--pseudo_note_onset_only", action="store_true",
                      help="when pseudo_note_target_only is enabled, keep only note-on tokens")
     ap.add_argument("--pseudo_note_without_chunk", action="store_true",
                      help="when pseudo_note_target_only is enabled, ignore chunk filter and use token-only mask")
+    ap.add_argument("--pseudo_repair_order", action="store_true",
+                     help="repair pseudo token order before chunk filter: same-time pitch low->high, on->off, dedup same token")
     ap.add_argument("--pseudo_debug_n", type=int, default=0,
                      help="save N pseudo-label debug samples (txt + piano roll) for kept chunks")
     ap.add_argument("--pseudo_debug_dir", type=str, default=None,
@@ -534,6 +536,7 @@ if __name__ == "__main__":
         pseudo_note_onset_only=args.pseudo_note_onset_only,
         pseudo_note_threshold=args.pseudo_note_threshold,
         pseudo_note_without_chunk=args.pseudo_note_without_chunk,
+        pseudo_repair_order=args.pseudo_repair_order,
         pseudo_debug_n=args.pseudo_debug_n,
         pseudo_debug_dir=args.pseudo_debug_dir,
         pseudo_debug_start_epoch=args.pseudo_debug_start_epoch,

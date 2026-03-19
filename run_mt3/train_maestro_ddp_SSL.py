@@ -317,6 +317,52 @@ if __name__ == "__main__":
                      help="compute unsupervised loss only on pseudo note tokens filtered by note confidence")
     ap.add_argument("--pseudo_note_threshold", type=float, default=-0.6,
                      help="minimum note-level confidence to keep pseudo note tokens")
+    ap.add_argument(
+        "--pseudo_note_prob_threshold",
+        type=float,
+        default=None,
+        help="note confidence threshold for output-probability score (default: fallback to --pseudo_note_threshold)",
+    )
+    ap.add_argument(
+        "--pseudo_note_mask_threshold",
+        type=float,
+        default=None,
+        help="note confidence threshold for mask-delta score (default: fallback to --pseudo_note_threshold)",
+    )
+    ap.add_argument(
+        "--pseudo_note_conf_mode",
+        type=str,
+        default="single",
+        choices=["single", "prob", "mask", "prob_and_mask", "prob_or_mask"],
+        help="how to combine output-probability and mask-delta confidences",
+    )
+    ap.add_argument(
+        "--pseudo_note_score_metric",
+        type=str,
+        default="logprob_mean",
+        choices=["logprob_mean", "abs_mask_delta", "log_abs_mask_delta"],
+        help="legacy single-score metric used when --pseudo_note_conf_mode=single",
+    )
+    ap.add_argument(
+        "--pseudo_note_mask_score_metric",
+        type=str,
+        default="abs_mask_delta",
+        choices=["abs_mask_delta", "log_abs_mask_delta"],
+        help="mask-delta metric used in mask/prob_and_mask/prob_or_mask modes",
+    )
+    ap.add_argument(
+        "--pseudo_note_mask_width_ratio",
+        type=float,
+        default=0.2,
+        help="mask band width ratio for mask-delta note score",
+    )
+    ap.add_argument(
+        "--pseudo_note_mask_fill",
+        type=str,
+        default="zero",
+        choices=["zero", "mean"],
+        help="mask fill strategy for mask-delta note score",
+    )
     ap.add_argument("--pseudo_note_onset_only", action="store_true",
                      help="when pseudo_note_target_only is enabled, keep only note-on tokens")
     ap.add_argument("--pseudo_note_without_chunk", action="store_true",
@@ -355,6 +401,8 @@ if __name__ == "__main__":
                      help="max time-token groups per sample for auxiliary onset TF (0=all)")
     ap.add_argument("--timewise_onset_tf_min_onsets", type=int, default=1,
                      help="minimum NOTE_ON count in a time group to include in auxiliary onset TF")
+    ap.add_argument("--pseudo_unsup_cross_attn_only", action="store_true",
+                     help="restrict pseudo-label unsupervised gradient update to decoder cross-attention only")
 
     # Saving
     ap.add_argument("--save-every", type=int, default=100)
@@ -541,6 +589,13 @@ if __name__ == "__main__":
         pseudo_note_target_only=args.pseudo_note_target_only,
         pseudo_note_onset_only=args.pseudo_note_onset_only,
         pseudo_note_threshold=args.pseudo_note_threshold,
+        pseudo_note_prob_threshold=args.pseudo_note_prob_threshold,
+        pseudo_note_mask_threshold=args.pseudo_note_mask_threshold,
+        pseudo_note_conf_mode=args.pseudo_note_conf_mode,
+        pseudo_note_score_metric=args.pseudo_note_score_metric,
+        pseudo_note_mask_score_metric=args.pseudo_note_mask_score_metric,
+        pseudo_note_mask_width_ratio=args.pseudo_note_mask_width_ratio,
+        pseudo_note_mask_fill=args.pseudo_note_mask_fill,
         pseudo_note_without_chunk=args.pseudo_note_without_chunk,
         pseudo_repair_order=args.pseudo_repair_order,
         pseudo_debug_n=args.pseudo_debug_n,
@@ -549,6 +604,7 @@ if __name__ == "__main__":
         timewise_onset_tf_weight=args.timewise_onset_tf_weight,
         timewise_onset_tf_max_groups=args.timewise_onset_tf_max_groups,
         timewise_onset_tf_min_onsets=args.timewise_onset_tf_min_onsets,
+        pseudo_unsup_cross_attn_only=args.pseudo_unsup_cross_attn_only,
         use_augment=not args.no_augment,
         epochs=args.epochs,
         bs=args.bs,

@@ -24,6 +24,7 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.autograd import Function
 from my_mt3.train import _maybe_cache_pairs_map, make_collate
 from my_mt3.augment import AugmentConfig, augment_spectrogram
+from my_mt3.analysis_attribution import apply_source_mask_band
 
 from dataclasses import dataclass
 from typing import List, Tuple, Dict, Optional
@@ -119,6 +120,100 @@ def build_note_confidences(note_spans: List[NoteSpan], log_prob_1d: torch.Tensor
             continue
         scores.append(float(log_prob_1d[idx].mean().item()))
     return np.array(scores)
+
+
+@torch.no_grad()
+def _teacher_forced_token_logp(
+    *,
+    model,
+    mel_1: torch.Tensor,   # [1,T,F]
+    y_in_1: torch.Tensor,  # [1,S]
+    y_tg_1: torch.Tensor,  # [1,S]
+) -> torch.Tensor:
+    """Per-position log-probability for a fixed target sequence."""
+    mem = model.enc(mel_1)
+    logits = model.dec(y_in_1, mem)[0]  # [S,V]
+    logp = torch.log_softmax(logits, dim=-1)
+    tgt = y_tg_1[0].long()
+    return logp.gather(dim=-1, index=tgt.unsqueeze(-1)).squeeze(-1)  # [S]
+
+
+def _token_time_frame_map(
+    token_ids: List[int],
+    *,
+    vocab: Vocab,
+    sr: int,
+    hop: int,
+    step_ms: int,
+) -> List[Optional[int]]:
+    id2time: Dict[int, int] = {tid: t for t, tid in vocab.time.items()}
+    cur_frame: Optional[int] = None
+    out: List[Optional[int]] = []
+    for tid in token_ids:
+        t = int(tid)
+        if t in id2time:
+            t_sec = (float(id2time[t]) * float(step_ms)) / 1000.0
+            cur_frame = int(round(t_sec * float(sr) / float(hop)))
+        out.append(cur_frame)
+    return out
+
+
+def _build_note_mask_effect_confidences(
+    *,
+    spans: List[NoteSpan],
+    token_ids: List[int],
+    base_logp_1d: torch.Tensor,
+    masked_logp_by_frame: Dict[int, torch.Tensor],
+    token_frame_map: List[Optional[int]],
+    note_on_ids: set[int],
+    use_log_of_abs: bool,
+    eps: float = 1e-8,
+) -> np.ndarray:
+    scores: List[float] = []
+    for ns in spans:
+        onset_tok_idx: Optional[int] = None
+        for t_idx in ns.tok_ids:
+            if 0 <= int(t_idx) < len(token_ids) and int(token_ids[int(t_idx)]) in note_on_ids:
+                onset_tok_idx = int(t_idx)
+                break
+        if onset_tok_idx is None:
+            onset_tok_idx = int(ns.tok_ids[0]) if ns.tok_ids else -1
+        if onset_tok_idx < 0 or onset_tok_idx >= int(base_logp_1d.numel()) or onset_tok_idx >= len(token_frame_map):
+            scores.append(-float("inf"))
+            continue
+        fr = token_frame_map[onset_tok_idx]
+        if fr is None or int(fr) not in masked_logp_by_frame:
+            scores.append(-float("inf"))
+            continue
+        masked_lp = masked_logp_by_frame[int(fr)]
+        if onset_tok_idx >= int(masked_lp.numel()):
+            scores.append(-float("inf"))
+            continue
+        delta_abs = float(abs(float(masked_lp[onset_tok_idx].item()) - float(base_logp_1d[onset_tok_idx].item())))
+        if use_log_of_abs:
+            scores.append(float(np.log(delta_abs + float(eps))))
+        else:
+            scores.append(float(delta_abs))
+    return np.asarray(scores, dtype=float)
+
+
+def _set_model_trainable_only_unsup_cross_attn(model: nn.Module) -> Dict[str, bool]:
+    """
+    Temporarily keep grads only for decoder cross-attention weights.
+    Returns previous requires_grad state map for restoration.
+    """
+    prev: Dict[str, bool] = {}
+    for name, p in model.named_parameters():
+        prev[name] = bool(p.requires_grad)
+        keep = (".dec.blocks." in name) and (".multihead_attn." in name)
+        p.requires_grad_(keep)
+    return prev
+
+
+def _restore_model_requires_grad(model: nn.Module, prev: Dict[str, bool]) -> None:
+    for name, p in model.named_parameters():
+        if name in prev:
+            p.requires_grad_(bool(prev[name]))
 
 def make_pseudo_token_mask_from_notes(
     note_spans: List[NoteSpan],
@@ -1018,6 +1113,13 @@ def train_loop_distributed_DA_confusion(
     pseudo_note_target_only: bool = False,
     pseudo_note_onset_only: bool = False,
     pseudo_note_threshold: float = -0.5,
+    pseudo_note_prob_threshold: Optional[float] = None,
+    pseudo_note_mask_threshold: Optional[float] = None,
+    pseudo_note_conf_mode: str = "single",
+    pseudo_note_score_metric: str = "logprob_mean",
+    pseudo_note_mask_score_metric: str = "abs_mask_delta",
+    pseudo_note_mask_width_ratio: float = 0.2,
+    pseudo_note_mask_fill: str = "zero",
     pseudo_note_without_chunk: bool = False,
     pseudo_repair_order: bool = False,
     pseudo_debug_n: int = 0,
@@ -1027,6 +1129,7 @@ def train_loop_distributed_DA_confusion(
     timewise_onset_tf_weight: float = 0.0,
     timewise_onset_tf_max_groups: int = 0,
     timewise_onset_tf_min_onsets: int = 1,
+    pseudo_unsup_cross_attn_only: bool = False,
     # ---- Augmentation ----
     use_augment: bool = True,
     # ---- 既存 ----
@@ -1166,6 +1269,21 @@ def train_loop_distributed_DA_confusion(
         if pseudo_note_without_chunk:
             msg += " (without chunk filter)"
         print(msg)
+        _print_conf_mode = str(pseudo_note_conf_mode)
+        _print_legacy_metric = str(pseudo_note_score_metric)
+        _print_mask_metric = str(pseudo_note_mask_score_metric)
+        _print_prob_th = float(pseudo_note_threshold if pseudo_note_prob_threshold is None else pseudo_note_prob_threshold)
+        _print_mask_th = float(pseudo_note_threshold if pseudo_note_mask_threshold is None else pseudo_note_mask_threshold)
+        print(
+            "[pseudo-note] conf mode="
+            f"{_print_conf_mode} | legacy_metric={_print_legacy_metric} "
+            f"| prob_th={_print_prob_th:.4f} | mask_metric={_print_mask_metric} | mask_th={_print_mask_th:.4f}"
+        )
+        if (_print_conf_mode in {"mask", "prob_and_mask", "prob_or_mask"}) or (_print_conf_mode == "single" and _print_legacy_metric in {"abs_mask_delta", "log_abs_mask_delta"}):
+            print(
+                "[pseudo-note] mask-effect params: "
+                f"width_ratio={float(pseudo_note_mask_width_ratio):.3f}, fill={str(pseudo_note_mask_fill)}"
+            )
     if rank == 0 and pseudo_repair_order:
         print("[pseudo-note] order-repair enabled: same-time pitch low->high, on->off, dedup same token")
     if rank == 0 and float(timewise_onset_tf_weight) > 0.0:
@@ -1175,6 +1293,8 @@ def train_loop_distributed_DA_confusion(
             f"max_groups={int(timewise_onset_tf_max_groups)}, "
             f"min_onsets={int(timewise_onset_tf_min_onsets)}"
         )
+    if rank == 0 and bool(pseudo_unsup_cross_attn_only):
+        print("[pseudo-unsup] cross-attention-only update enabled")
     pseudo_debug_written = 0
     pseudo_debug_root = str(pseudo_debug_dir) if pseudo_debug_dir else os.path.join(save_dir, "pseudo_debug")
     pseudo_metrics_csv = os.path.join(pseudo_debug_root, "pseudo_metrics.csv")
@@ -1311,6 +1431,35 @@ def train_loop_distributed_DA_confusion(
             print(f"[resume] start_epoch ({start_epoch}) >= epochs ({epochs}); nothing to train")
         dist.destroy_process_group()
         return model_ddp
+
+    _note_conf_mode = str(pseudo_note_conf_mode)
+    _valid_note_conf_modes = {"single", "prob", "mask", "prob_and_mask", "prob_or_mask"}
+    if _note_conf_mode not in _valid_note_conf_modes:
+        raise ValueError(
+            f"invalid pseudo_note_conf_mode={_note_conf_mode} "
+            f"(choose one of {sorted(_valid_note_conf_modes)})"
+        )
+
+    _note_score_metric = str(pseudo_note_score_metric)
+    _valid_note_score_metrics = {"logprob_mean", "abs_mask_delta", "log_abs_mask_delta"}
+    if _note_score_metric not in _valid_note_score_metrics:
+        raise ValueError(
+            f"invalid pseudo_note_score_metric={_note_score_metric} "
+            f"(choose one of {sorted(_valid_note_score_metrics)})"
+        )
+    _mask_score_metric = str(pseudo_note_mask_score_metric)
+    _valid_mask_score_metrics = {"abs_mask_delta", "log_abs_mask_delta"}
+    if _mask_score_metric not in _valid_mask_score_metrics:
+        raise ValueError(
+            f"invalid pseudo_note_mask_score_metric={_mask_score_metric} "
+            f"(choose one of {sorted(_valid_mask_score_metrics)})"
+        )
+
+    _prob_threshold = float(pseudo_note_threshold if pseudo_note_prob_threshold is None else pseudo_note_prob_threshold)
+    _mask_threshold = float(pseudo_note_threshold if pseudo_note_mask_threshold is None else pseudo_note_mask_threshold)
+
+    _mask_fill = "mean" if str(pseudo_note_mask_fill) == "mean" else "zero"
+    _step_ms_note_metric = 10
 
     aug_cfg = AugmentConfig() if use_augment else None
     # ---- loop ----
@@ -1491,8 +1640,93 @@ def train_loop_distributed_DA_confusion(
                             spans = decode_notes_to_spans(out[b_idx].tolist(), vocab)
                             if len(spans) == 0:
                                 continue
-                            scores = build_note_confidences(spans, log_prob[b_idx])
-                            keep_note_idxs = np.where(scores >= float(pseudo_note_threshold))[0].tolist()
+                            prob_scores = build_note_confidences(spans, log_prob[b_idx])
+
+                            need_mask_scores = (
+                                _note_conf_mode in {"mask", "prob_and_mask", "prob_or_mask"}
+                                or (_note_conf_mode == "single" and _note_score_metric in {"abs_mask_delta", "log_abs_mask_delta"})
+                            )
+                            mask_scores = None
+                            if need_mask_scores:
+                                token_ids_b = [int(t) for t in out[b_idx].tolist()]
+                                y_in_b = y_in_p[b_idx].unsqueeze(0)
+                                y_tg_b = y_tg_p[b_idx].unsqueeze(0)
+                                with torch.no_grad():
+                                    base_tf_logp = _teacher_forced_token_logp(
+                                        model=ema.teacher,
+                                        mel_1=mels_r[b_idx:b_idx + 1],
+                                        y_in_1=y_in_b,
+                                        y_tg_1=y_tg_b,
+                                    )
+                                frame_map = _token_time_frame_map(
+                                    token_ids_b,
+                                    vocab=vocab,
+                                    sr=int(sr),
+                                    hop=256,
+                                    step_ms=int(_step_ms_note_metric),
+                                )
+                                note_on_ids = set(vocab.note_on.values())
+                                onset_pos = []
+                                for ns in spans:
+                                    found = None
+                                    for t_idx in ns.tok_ids:
+                                        if 0 <= int(t_idx) < len(token_ids_b) and int(token_ids_b[int(t_idx)]) in note_on_ids:
+                                            found = int(t_idx)
+                                            break
+                                    onset_pos.append(int(found if found is not None else (ns.tok_ids[0] if ns.tok_ids else -1)))
+                                needed_frames = sorted(
+                                    {
+                                        int(frame_map[p])
+                                        for p in onset_pos
+                                        if (0 <= int(p) < len(frame_map)) and (frame_map[p] is not None)
+                                    }
+                                )
+                                masked_by_frame: Dict[int, torch.Tensor] = {}
+                                for fr in needed_frames:
+                                    mel_mask = apply_source_mask_band(
+                                        mels_r[b_idx:b_idx + 1],
+                                        center_frame=int(fr),
+                                        width_ratio=float(pseudo_note_mask_width_ratio),
+                                        fill=_mask_fill,
+                                    )
+                                    with torch.no_grad():
+                                        masked_by_frame[int(fr)] = _teacher_forced_token_logp(
+                                            model=ema.teacher,
+                                            mel_1=mel_mask,
+                                            y_in_1=y_in_b,
+                                            y_tg_1=y_tg_b,
+                                        )
+                                mask_scores = _build_note_mask_effect_confidences(
+                                    spans=spans,
+                                    token_ids=token_ids_b,
+                                    base_logp_1d=base_tf_logp,
+                                    masked_logp_by_frame=masked_by_frame,
+                                    token_frame_map=frame_map,
+                                    note_on_ids=note_on_ids,
+                                    use_log_of_abs=(_mask_score_metric == "log_abs_mask_delta"),
+                                )
+
+                            if _note_conf_mode == "single":
+                                if _note_score_metric == "logprob_mean":
+                                    keep_mask_note = prob_scores >= float(_prob_threshold)
+                                else:
+                                    keep_mask_note = np.asarray(mask_scores, dtype=float) >= float(_mask_threshold)
+                            elif _note_conf_mode == "prob":
+                                keep_mask_note = prob_scores >= float(_prob_threshold)
+                            elif _note_conf_mode == "mask":
+                                if mask_scores is None:
+                                    mask_scores = np.full_like(prob_scores, fill_value=-float("inf"), dtype=float)
+                                keep_mask_note = mask_scores >= float(_mask_threshold)
+                            elif _note_conf_mode == "prob_and_mask":
+                                if mask_scores is None:
+                                    mask_scores = np.full_like(prob_scores, fill_value=-float("inf"), dtype=float)
+                                keep_mask_note = (prob_scores >= float(_prob_threshold)) & (mask_scores >= float(_mask_threshold))
+                            else:  # prob_or_mask
+                                if mask_scores is None:
+                                    mask_scores = np.full_like(prob_scores, fill_value=-float("inf"), dtype=float)
+                                keep_mask_note = (prob_scores >= float(_prob_threshold)) | (mask_scores >= float(_mask_threshold))
+
+                            keep_note_idxs = np.where(keep_mask_note)[0].tolist()
                             if not keep_note_idxs:
                                 continue
                             for n_idx in keep_note_idxs:
@@ -1628,15 +1862,28 @@ def train_loop_distributed_DA_confusion(
                         logits_r = model_ddp.module.dec(y_in_p.to(device), mem_r_student)
                         loss_unsup = crit_ce(logits_r.reshape(-1, logits_r.size(-1)), y_tg_masked.to(device).reshape(-1))
 
-            loss_total = (
+            loss_main = (
                 loss_sup
                 + float(timewise_onset_tf_weight) * loss_sup_timewise
                 + lambda_adv * loss_adv
-                + unsup_weight * loss_unsup
             )
+            loss_total = loss_main + unsup_weight * loss_unsup
 
             opt_t.zero_grad(set_to_none=True)
-            loss_total.backward()
+            use_cross_only_unsup = bool(
+                pseudo_unsup_cross_attn_only
+                and float(unsup_weight) != 0.0
+                and bool(loss_unsup.requires_grad)
+            )
+            if use_cross_only_unsup:
+                loss_main.backward(retain_graph=True)
+                prev_req = _set_model_trainable_only_unsup_cross_attn(model_ddp.module)
+                try:
+                    (unsup_weight * loss_unsup).backward()
+                finally:
+                    _restore_model_requires_grad(model_ddp.module, prev_req)
+            else:
+                loss_total.backward()
             opt_t.step()
             sch_t.step()
 

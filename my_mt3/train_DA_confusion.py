@@ -165,6 +165,104 @@ def apply_mask_to_targets(y_tg: torch.Tensor, token_mask: torch.Tensor, ignore_i
     return y
 
 
+def _collect_timewise_onset_sequences_from_target(
+    *,
+    target_tokens: List[int],
+    vocab: Vocab,
+    max_groups: int = 0,
+    min_onsets_per_group: int = 1,
+) -> List[List[int]]:
+    """Build [TIM_t, NOTE_ON...] sequences from one target row."""
+    time_ids = set(vocab.time.values())
+    note_on_ids = set(vocab.note_on.values())
+    pad_id = int(vocab.pad)
+
+    groups: List[List[int]] = []
+    cur_time: Optional[int] = None
+    cur_onsets: List[int] = []
+
+    def _flush() -> None:
+        nonlocal cur_time, cur_onsets
+        if cur_time is None:
+            return
+        if len(cur_onsets) >= int(min_onsets_per_group):
+            groups.append([int(cur_time), *[int(t) for t in cur_onsets]])
+        cur_time = None
+        cur_onsets = []
+
+    for tok in target_tokens:
+        tid = int(tok)
+        if tid == pad_id:
+            continue
+        if tid in time_ids:
+            _flush()
+            cur_time = tid
+            continue
+        if (cur_time is not None) and (tid in note_on_ids):
+            cur_onsets.append(tid)
+
+    _flush()
+
+    if int(max_groups) > 0:
+        groups = groups[: int(max_groups)]
+    return groups
+
+
+def _build_timewise_onset_tf_batch(
+    *,
+    y_tg: torch.Tensor,
+    vocab: Vocab,
+    max_groups_per_sample: int = 0,
+    min_onsets_per_group: int = 1,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """
+    Returns:
+      sample_indices: [N_aux]  index of source sample in current batch
+      y_in_aux:       [N_aux, S_aux]
+      y_tg_aux:       [N_aux, S_aux]
+    """
+    if y_tg.ndim != 2:
+        return None
+
+    pad_id = int(vocab.pad)
+    seqs: List[List[int]] = []
+    src_idx: List[int] = []
+
+    for b_idx, row in enumerate(y_tg.detach().cpu().tolist()):
+        groups = _collect_timewise_onset_sequences_from_target(
+            target_tokens=[int(t) for t in row],
+            vocab=vocab,
+            max_groups=int(max_groups_per_sample),
+            min_onsets_per_group=int(min_onsets_per_group),
+        )
+        for g in groups:
+            if len(g) >= 3:
+                seqs.append(g)
+                src_idx.append(int(b_idx))
+
+    if len(seqs) == 0:
+        return None
+
+    max_len = max(len(s) - 1 for s in seqs)
+    if max_len <= 0:
+        return None
+
+    dev = y_tg.device
+    y_in_aux = torch.full((len(seqs), max_len), pad_id, dtype=torch.long, device=dev)
+    y_tg_aux = torch.full((len(seqs), max_len), pad_id, dtype=torch.long, device=dev)
+
+    for i, s in enumerate(seqs):
+        yin = s[:-1]
+        ytg = s[1:]
+        L = min(max_len, len(yin))
+        if L > 0:
+            y_in_aux[i, :L] = torch.tensor(yin[:L], dtype=torch.long, device=dev)
+            y_tg_aux[i, :L] = torch.tensor(ytg[:L], dtype=torch.long, device=dev)
+
+    sample_indices = torch.tensor(src_idx, dtype=torch.long, device=dev)
+    return sample_indices, y_in_aux, y_tg_aux
+
+
 @dataclass
 class PseudoNoteEvent:
     pitch: int
@@ -796,10 +894,12 @@ def eval_loop_ddp(
     token_count = torch.zeros(1, device=device)
     pad_id = int(crit.ignore_index)
 
-    mir_onset_f_sum = torch.zeros(1, device=device)
     mir_onset_pitch_f_sum = torch.zeros(1, device=device)
+    mir_onset_pitch_p_sum = torch.zeros(1, device=device)
+    mir_onset_pitch_r_sum = torch.zeros(1, device=device)
     mir_note_f_sum = torch.zeros(1, device=device)
-    mir_note_vel_f_sum = torch.zeros(1, device=device)
+    mir_note_p_sum = torch.zeros(1, device=device)
+    mir_note_r_sum = torch.zeros(1, device=device)
     mir_count = torch.zeros(1, device=device)
 
     if compute_mir_eval:
@@ -841,10 +941,12 @@ def eval_loop_ddp(
                     )
                 except Exception:
                     continue
-                mir_onset_f_sum += float(met.get("onset_f", 0.0))
                 mir_onset_pitch_f_sum += float(met.get("onset_pitch_f", 0.0))
+                mir_onset_pitch_p_sum += float(met.get("onset_pitch_p", 0.0))
+                mir_onset_pitch_r_sum += float(met.get("onset_pitch_r", 0.0))
                 mir_note_f_sum += float(met.get("note_f", 0.0))
-                mir_note_vel_f_sum += float(met.get("note_vel_f", 0.0))
+                mir_note_p_sum += float(met.get("note_p", 0.0))
+                mir_note_r_sum += float(met.get("note_r", 0.0))
                 mir_count += 1.0
 
     # allreduce
@@ -854,26 +956,32 @@ def eval_loop_ddp(
         dist.all_reduce(token_correct, op=dist.ReduceOp.SUM)
         dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
     if compute_mir_eval:
-        dist.all_reduce(mir_onset_f_sum, op=dist.ReduceOp.SUM)
         dist.all_reduce(mir_onset_pitch_f_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(mir_onset_pitch_p_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(mir_onset_pitch_r_sum, op=dist.ReduceOp.SUM)
         dist.all_reduce(mir_note_f_sum, op=dist.ReduceOp.SUM)
-        dist.all_reduce(mir_note_vel_f_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(mir_note_p_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(mir_note_r_sum, op=dist.ReduceOp.SUM)
         dist.all_reduce(mir_count, op=dist.ReduceOp.SUM)
 
     val_loss = (total_loss / torch.clamp(n_batches, min=1)).item()
     val_token_acc = (token_correct / torch.clamp(token_count, min=1)).item() if compute_token_acc else 0.0
     denom = torch.clamp(mir_count, min=1.0)
-    val_onset_f = (mir_onset_f_sum / denom).item() if compute_mir_eval else 0.0
     val_onset_pitch_f = (mir_onset_pitch_f_sum / denom).item() if compute_mir_eval else 0.0
+    val_onset_pitch_p = (mir_onset_pitch_p_sum / denom).item() if compute_mir_eval else 0.0
+    val_onset_pitch_r = (mir_onset_pitch_r_sum / denom).item() if compute_mir_eval else 0.0
     val_note_f = (mir_note_f_sum / denom).item() if compute_mir_eval else 0.0
-    val_note_vel_f = (mir_note_vel_f_sum / denom).item() if compute_mir_eval else 0.0
+    val_note_p = (mir_note_p_sum / denom).item() if compute_mir_eval else 0.0
+    val_note_r = (mir_note_r_sum / denom).item() if compute_mir_eval else 0.0
     return {
         "val_loss": float(val_loss),
         "val_token_acc": float(val_token_acc),
-        "val_onset_f": float(val_onset_f),
         "val_onset_pitch_f": float(val_onset_pitch_f),
+        "val_onset_pitch_p": float(val_onset_pitch_p),
+        "val_onset_pitch_r": float(val_onset_pitch_r),
         "val_note_f": float(val_note_f),
-        "val_note_vel_f": float(val_note_vel_f),
+        "val_note_p": float(val_note_p),
+        "val_note_r": float(val_note_r),
     }
 
 
@@ -915,6 +1023,10 @@ def train_loop_distributed_DA_confusion(
     pseudo_debug_n: int = 0,
     pseudo_debug_dir: str | None = None,
     pseudo_debug_start_epoch: int = 0,  # deprecated: debug starts at pseudo_start_epoch
+    # ---- Auxiliary teacher forcing (timewise onset) ----
+    timewise_onset_tf_weight: float = 0.0,
+    timewise_onset_tf_max_groups: int = 0,
+    timewise_onset_tf_min_onsets: int = 1,
     # ---- Augmentation ----
     use_augment: bool = True,
     # ---- 既存 ----
@@ -1056,6 +1168,13 @@ def train_loop_distributed_DA_confusion(
         print(msg)
     if rank == 0 and pseudo_repair_order:
         print("[pseudo-note] order-repair enabled: same-time pitch low->high, on->off, dedup same token")
+    if rank == 0 and float(timewise_onset_tf_weight) > 0.0:
+        print(
+            "[timewise-tf] enabled: "
+            f"weight={float(timewise_onset_tf_weight):.4f}, "
+            f"max_groups={int(timewise_onset_tf_max_groups)}, "
+            f"min_onsets={int(timewise_onset_tf_min_onsets)}"
+        )
     pseudo_debug_written = 0
     pseudo_debug_root = str(pseudo_debug_dir) if pseudo_debug_dir else os.path.join(save_dir, "pseudo_debug")
     pseudo_metrics_csv = os.path.join(pseudo_debug_root, "pseudo_metrics.csv")
@@ -1136,7 +1255,9 @@ def train_loop_distributed_DA_confusion(
                 if mode == "w":
                     w.writerow([
                         "epoch", "train_total", "train_sup", "train_adv", "train_unsup", "train_disc", "val_loss",
-                        "val_token_acc", "val_onset_f", "val_onset_pitch_f", "val_note_f", "val_note_vel_f",
+                        "val_token_acc",
+                        "val_onset_pitch_f", "val_onset_pitch_p", "val_onset_pitch_r",
+                        "val_note_f", "val_note_p", "val_note_r",
                         "pseudo_chunks", "pseudo_notes"
                     ])
         except Exception:
@@ -1249,6 +1370,22 @@ def train_loop_distributed_DA_confusion(
             # (1) supervised CE on synth
             logits_s = model_ddp.module.dec(y_in_s, mem_s)
             loss_sup = crit_ce(logits_s.reshape(-1, logits_s.size(-1)), y_tg_s.reshape(-1))
+            loss_sup_timewise = torch.zeros((), device=device)
+            if float(timewise_onset_tf_weight) > 0.0:
+                aux_batch = _build_timewise_onset_tf_batch(
+                    y_tg=y_tg_s,
+                    vocab=vocab,
+                    max_groups_per_sample=int(timewise_onset_tf_max_groups),
+                    min_onsets_per_group=int(timewise_onset_tf_min_onsets),
+                )
+                if aux_batch is not None:
+                    src_idx_aux, y_in_aux, y_tg_aux = aux_batch
+                    mem_aux = mem_s.index_select(0, src_idx_aux)
+                    logits_aux = model_ddp.module.dec(y_in_aux, mem_aux)
+                    loss_sup_timewise = crit_ce(
+                        logits_aux.reshape(-1, logits_aux.size(-1)),
+                        y_tg_aux.reshape(-1),
+                    )
 
             # (2) adversarial confusion on synth+real
             loss_adv = torch.zeros((), device=device)
@@ -1491,7 +1628,12 @@ def train_loop_distributed_DA_confusion(
                         logits_r = model_ddp.module.dec(y_in_p.to(device), mem_r_student)
                         loss_unsup = crit_ce(logits_r.reshape(-1, logits_r.size(-1)), y_tg_masked.to(device).reshape(-1))
 
-            loss_total = loss_sup + lambda_adv * loss_adv + unsup_weight * loss_unsup
+            loss_total = (
+                loss_sup
+                + float(timewise_onset_tf_weight) * loss_sup_timewise
+                + lambda_adv * loss_adv
+                + unsup_weight * loss_unsup
+            )
 
             opt_t.zero_grad(set_to_none=True)
             loss_total.backward()
@@ -1517,6 +1659,7 @@ def train_loop_distributed_DA_confusion(
                 pbar.set_postfix(
                     loss=f"{loss_total.item():.3f}",
                     sup=f"{loss_sup.item():.3f}",
+                    sup_tw=f"{loss_sup_timewise.item():.3f}",
                     adv=f"{loss_adv.item():.3f}",
                     unsup=f"{float(loss_unsup.item()):.3f}",
                     disc=f"{loss_disc.item():.3f}",
@@ -1526,10 +1669,12 @@ def train_loop_distributed_DA_confusion(
         # ---- val (optional) ----
         val_loss = 0.0
         val_token_acc = 0.0
-        val_onset_f = 0.0
         val_onset_pitch_f = 0.0
+        val_onset_pitch_p = 0.0
+        val_onset_pitch_r = 0.0
         val_note_f = 0.0
-        val_note_vel_f = 0.0
+        val_note_p = 0.0
+        val_note_r = 0.0
         if (ep + 1) % int(val_every) == 0 or (ep + 1) == epochs:
             val_metrics = eval_loop_ddp(
                 model_ddp,
@@ -1542,10 +1687,12 @@ def train_loop_distributed_DA_confusion(
             )
             val_loss = float(val_metrics["val_loss"])
             val_token_acc = float(val_metrics["val_token_acc"])
-            val_onset_f = float(val_metrics["val_onset_f"])
             val_onset_pitch_f = float(val_metrics["val_onset_pitch_f"])
+            val_onset_pitch_p = float(val_metrics["val_onset_pitch_p"])
+            val_onset_pitch_r = float(val_metrics["val_onset_pitch_r"])
             val_note_f = float(val_metrics["val_note_f"])
-            val_note_vel_f = float(val_metrics["val_note_vel_f"])
+            val_note_p = float(val_metrics["val_note_p"])
+            val_note_r = float(val_metrics["val_note_r"])
 
         if rank == 0:
             denom = max(1, n_batches)
@@ -1557,8 +1704,8 @@ def train_loop_distributed_DA_confusion(
             print(
                 f"[epoch {ep+1}] train_loss={avg_total:.3f} | "
                 f"val_loss={val_loss:.3f} | val_token_acc={val_token_acc:.4f} | "
-                f"onset_f={val_onset_f:.4f} | onset_pitch_f={val_onset_pitch_f:.4f} | "
-                f"note_f={val_note_f:.4f} | note_vel_f={val_note_vel_f:.4f}"
+                f"onset_pitch(f/p/r)={val_onset_pitch_f:.4f}/{val_onset_pitch_p:.4f}/{val_onset_pitch_r:.4f} | "
+                f"note(f/p/r)={val_note_f:.4f}/{val_note_p:.4f}/{val_note_r:.4f}"
             )
             # CSVへ追記
             try:
@@ -1568,7 +1715,8 @@ def train_loop_distributed_DA_confusion(
                     w.writerow([
                         ep+1, f"{avg_total:.6f}", f"{avg_sup:.6f}", f"{avg_adv:.6f}", f"{avg_unsup:.6f}",
                         f"{avg_disc:.6f}", f"{val_loss:.6f}", f"{val_token_acc:.6f}",
-                        f"{val_onset_f:.6f}", f"{val_onset_pitch_f:.6f}", f"{val_note_f:.6f}", f"{val_note_vel_f:.6f}",
+                        f"{val_onset_pitch_f:.6f}", f"{val_onset_pitch_p:.6f}", f"{val_onset_pitch_r:.6f}",
+                        f"{val_note_f:.6f}", f"{val_note_p:.6f}", f"{val_note_r:.6f}",
                         running_pseudo_chunks, running_pseudo_notes
                     ])
             except Exception:

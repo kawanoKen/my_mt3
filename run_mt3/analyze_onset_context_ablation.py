@@ -5,6 +5,9 @@ import json
 from pathlib import Path
 from typing import List, Tuple
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
@@ -94,6 +97,63 @@ def insert_tokens_keep_length(
     return torch.tensor(arr, dtype=seq.dtype, device=seq.device)
 
 
+def _plot_results(df: pd.DataFrame, out_png: Path) -> None:
+    if df.empty:
+        return
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8), sharex=False)
+    ops = [("delete", axes[0, 0], axes[1, 0]), ("add", axes[0, 1], axes[1, 1])]
+
+    for op, ax_delta, ax_abs in ops:
+        sub = df[df["operation"] == op].copy()
+        if sub.empty:
+            ax_delta.set_title(f"{op}: no data")
+            ax_abs.set_title(f"{op}: no data")
+            ax_delta.grid(alpha=0.3)
+            ax_abs.grid(alpha=0.3)
+            continue
+
+        g = sub.groupby("ratio", as_index=False).agg(
+            delta_mean=("delta", "mean"),
+            delta_std=("delta", "std"),
+            abs_mean=("abs_delta", "mean"),
+            abs_std=("abs_delta", "std"),
+            base_mean=("base_p_target", "mean"),
+            ablated_mean=("ablated_p_target", "mean"),
+        ).sort_values("ratio")
+
+        x = g["ratio"].to_numpy(dtype=float)
+        d = g["delta_mean"].to_numpy(dtype=float)
+        ds = g["delta_std"].fillna(0.0).to_numpy(dtype=float)
+        a = g["abs_mean"].to_numpy(dtype=float)
+        astd = g["abs_std"].fillna(0.0).to_numpy(dtype=float)
+        bmean = g["base_mean"].to_numpy(dtype=float)
+        amean = g["ablated_mean"].to_numpy(dtype=float)
+
+        ax_delta.plot(x, d, marker="o", label="ΔP(target onset token) mean")
+        ax_delta.fill_between(x, d - ds, d + ds, alpha=0.2, label="±1 std")
+        ax_delta.plot(x, bmean, marker="x", linestyle="--", label="base P mean")
+        ax_delta.plot(x, amean, marker="s", linestyle="--", label="ablated P mean")
+        ax_delta.set_title(f"{op}: signed change")
+        ax_delta.set_xlabel("perturb ratio")
+        ax_delta.set_ylabel("probability")
+        ax_delta.grid(alpha=0.3)
+        ax_delta.legend(loc="best")
+
+        ax_abs.plot(x, a, marker="o", color="tab:red", label="|ΔP(target onset token)| mean")
+        ax_abs.fill_between(x, a - astd, a + astd, alpha=0.2, color="tab:red", label="±1 std")
+        ax_abs.set_title(f"{op}: absolute change")
+        ax_abs.set_xlabel("perturb ratio")
+        ax_abs.set_ylabel("probability")
+        ax_abs.grid(alpha=0.3)
+        ax_abs.legend(loc="best")
+
+    fig.suptitle("Onset Context Ablation (single-song oriented view)", fontsize=13)
+    fig.tight_layout()
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_png, dpi=150)
+    plt.close(fig)
+
+
 @torch.no_grad()
 def run_ablation(
     model: MT3Mini,
@@ -107,10 +167,16 @@ def run_ablation(
     include_time_tokens_in_deletion: bool,
     operation: str,
     add_source: str,
+    context_source: str,
     max_batches: int,
     seed: int,
 ) -> dict:
-    note_on_ids = torch.tensor(list(vocab.note_on.values()), dtype=torch.long, device=device)
+    if context_source != "gt":
+        raise ValueError(f"Unsupported context_source: {context_source} (currently only 'gt')")
+
+    note_on_ids_list = list(vocab.note_on.values())
+    note_on_ids = torch.tensor(note_on_ids_list, dtype=torch.long, device=device)
+    note_on_set = set(int(x) for x in note_on_ids_list)
     time_ids = set(int(tid) for tid in vocab.time.values())
     pad_id = int(vocab.pad)
 
@@ -123,24 +189,31 @@ def run_ablation(
         y_in = y_in.to(device, non_blocking=True)
         y_tg = y_tg.to(device, non_blocking=True)
 
+        # context_source='gt': y_in/y_tg are built from GT MIDI token sequence by AMTDataset/make_collate.
         logits = model(mels, y_in)
-        p_on = torch.softmax(logits, dim=-1).index_select(2, note_on_ids).sum(dim=2)  # [B, S]
+        probs = torch.softmax(logits, dim=-1)  # [B, S, V]
 
         bsz, seq_len = y_in.shape
         for b in range(bsz):
-            # 対象位置: TIM_* token の位置（その位置で次トークンとしてnote_onが出る確率を見る）
-            pos = [
-                i for i in range(seq_len)
-                if int(y_in[b, i].item()) in time_ids and int(y_tg[b, i].item()) != pad_id
-            ]
-            if not pos:
+            # 対象位置: y_tg が NOTE_ON の位置（= その正解onset token）。
+            onset_pos = [i for i in range(seq_len) if int(y_tg[b, i].item()) in note_on_set]
+            if not onset_pos:
                 continue
-            if len(pos) > positions_per_sample:
-                pos = sorted(rng.choice(pos, size=int(positions_per_sample), replace=False).tolist())
+            if len(onset_pos) > positions_per_sample:
+                onset_pos = sorted(rng.choice(onset_pos, size=int(positions_per_sample), replace=False).tolist())
 
-            for s in pos:
-                base_p = float(p_on[b, s].item())
-                prefix_idxs = list(range(0, int(s)))
+            for s in onset_pos:
+                target_token_id = int(y_tg[b, s].item())
+
+                # 「対応するtime token」= y_in の中で s 以下にある最新 TIM_*
+                time_pos_candidates = [j for j in range(int(s) + 1) if int(y_in[b, j].item()) in time_ids]
+                if not time_pos_candidates:
+                    continue
+                time_pos = int(time_pos_candidates[-1])
+
+                base_p = float(probs[b, s, target_token_id].item())
+                # 削除/追加対象は対応TIMより前のみ
+                prefix_idxs = list(range(0, time_pos))
                 if len(prefix_idxs) <= 1:
                     continue
 
@@ -164,7 +237,7 @@ def run_ablation(
                                 y_in_abl = delete_indices_keep_length(y_in[b], remove_idx, pad_id=pad_id)
                                 new_s = int(s) - sum(1 for x in remove_idx if int(x) < int(s))
                             else:
-                                # add: prefix内にトークン挿入
+                                # add: GT prefix 内にトークン挿入
                                 insert_pos = rng.choice(prefix_idxs, size=k, replace=False).tolist()
                                 if add_source == "prefix":
                                     src_tokens = [int(y_in[b, i].item()) for i in prefix_idxs]
@@ -183,16 +256,19 @@ def run_ablation(
 
                             new_s = max(0, min(int(seq_len - 1), new_s))
                             logits_abl = model(mels[b:b+1], y_in_abl.unsqueeze(0))
-                            p_on_abl = torch.softmax(logits_abl, dim=-1).index_select(2, note_on_ids).sum(dim=2)
-                            ablated_p = float(p_on_abl[0, new_s].item())
+                            probs_abl = torch.softmax(logits_abl, dim=-1)
+                            ablated_p = float(probs_abl[0, new_s, target_token_id].item())
 
                             records.append(
                                 {
                                     "operation": str(op),
                                     "ratio": float(r),
                                     "trial": int(t),
-                                    "base_p_on": base_p,
-                                    "ablated_p_on": ablated_p,
+                                    "target_token_id": int(target_token_id),
+                                    "target_pos": int(s),
+                                    "time_pos": int(time_pos),
+                                    "base_p_target": base_p,
+                                    "ablated_p_target": ablated_p,
                                     "delta": float(ablated_p - base_p),
                                     "abs_delta": float(abs(ablated_p - base_p)),
                                 }
@@ -215,8 +291,8 @@ def run_ablation(
             ]
             if not rs:
                 continue
-            base = np.array([x["base_p_on"] for x in rs], dtype=np.float64)
-            abl = np.array([x["ablated_p_on"] for x in rs], dtype=np.float64)
+            base = np.array([x["base_p_target"] for x in rs], dtype=np.float64)
+            abl = np.array([x["ablated_p_target"] for x in rs], dtype=np.float64)
             delta = np.array([x["delta"] for x in rs], dtype=np.float64)
             abs_delta = np.array([x["abs_delta"] for x in rs], dtype=np.float64)
             summary[f"{op}:{r}"] = {
@@ -244,8 +320,8 @@ def run_ablation(
 def main() -> None:
     ap = argparse.ArgumentParser(
         description=(
-            "Analyze how P(note_on) changes when deleting arbitrary tokens "
-            "before a TIM_* token."
+            "Analyze how P(target onset token) changes when perturbing tokens "
+            "before the corresponding TIM_* token."
         )
     )
     ap.add_argument("--ckpt", type=str, required=True)
@@ -253,7 +329,7 @@ def main() -> None:
     ap.add_argument("--split", type=str, default="validation", choices=["train", "validation", "test"])
     ap.add_argument("--input_frames", type=int, default=256)
     ap.add_argument("--bs", type=int, default=2)
-    ap.add_argument("--max_songs", type=int, default=8, help="0=all")
+    ap.add_argument("--max_songs", type=int, default=1, help="0=all")
     ap.add_argument("--max_batches", type=int, default=20, help="0=all")
     ap.add_argument("--positions_per_sample", type=int, default=8)
     ap.add_argument("--ratios", type=str, default="0.1,0.3,0.5,0.7")
@@ -273,8 +349,17 @@ def main() -> None:
         choices=["prefix", "random_vocab"],
         help="token source for add-operation insertion",
     )
+    ap.add_argument(
+        "--context_source",
+        type=str,
+        default="gt",
+        choices=["gt"],
+        help="which token sequence is perturbed (currently GT MIDI tokens only)",
+    )
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--out_json", type=str, default="outputs/onset_context_ablation.json")
+    ap.add_argument("--out_png", type=str, default="outputs/onset_context_ablation_plot.png")
+    ap.add_argument("--out_csv", type=str, default="outputs/onset_context_ablation_records.csv")
     ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
 
@@ -322,6 +407,7 @@ def main() -> None:
         include_time_tokens_in_deletion=bool(args.include_time_tokens_in_deletion),
         operation=str(args.operation),
         add_source=str(args.add_source),
+        context_source=str(args.context_source),
         max_batches=int(args.max_batches),
         seed=int(args.seed),
     )
@@ -336,6 +422,7 @@ def main() -> None:
         "trials_per_ratio": int(args.trials_per_ratio),
         "operation": str(args.operation),
         "add_source": str(args.add_source),
+        "context_source": str(args.context_source),
         "include_time_tokens_in_deletion": bool(args.include_time_tokens_in_deletion),
         "n_records": int(res["n_records"]),
         "batch_count": int(res["batch_count"]),
@@ -345,9 +432,21 @@ def main() -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
 
+    # 保存しやすいように、全recordをCSV化＋可視化
+    df = pd.DataFrame(res["records"])
+    csv_path = Path(args.out_csv)
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(csv_path, index=False)
+
+    png_path = Path(args.out_png)
+    _plot_results(df, png_path)
+
     print("=== Onset Context Ablation ===")
     print(f"ckpt: {args.ckpt}")
-    print(f"split: {args.split}  records: {res['n_records']}  batches: {res['batch_count']}")
+    print(
+        f"split: {args.split}  context_source: {args.context_source}  "
+        f"records: {res['n_records']}  batches: {res['batch_count']}"
+    )
     for key in sorted(res["summary"].keys()):
         s = res["summary"][key]
         print(
@@ -355,7 +454,9 @@ def main() -> None:
             f"base={s['base_mean']:.6f} -> ablated={s['ablated_mean']:.6f}  "
             f"delta_mean={s['delta_mean']:.6f}  abs_delta_mean={s['abs_delta_mean']:.6f}"
         )
-    print(f"saved: {out_path}")
+    print(f"saved json: {out_path}")
+    print(f"saved csv : {csv_path}")
+    print(f"saved png : {png_path}")
 
 
 if __name__ == "__main__":

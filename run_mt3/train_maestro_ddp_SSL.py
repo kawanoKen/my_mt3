@@ -349,6 +349,12 @@ if __name__ == "__main__":
                           "pseudo note tokens matched to GT notes (same pitch, close onset/offset)")
     ap.add_argument("--oracle_note_without_chunk", action="store_true",
                      help="when oracle_note_target_only is enabled, ignore oracle chunk filter and use token-only mask")
+    ap.add_argument("--timewise_onset_tf_weight", type=float, default=0.0,
+                     help="aux loss weight: teacher forcing on [TIM_t -> NOTE_ON@t] sequences")
+    ap.add_argument("--timewise_onset_tf_max_groups", type=int, default=0,
+                     help="max time-token groups per sample for auxiliary onset TF (0=all)")
+    ap.add_argument("--timewise_onset_tf_min_onsets", type=int, default=1,
+                     help="minimum NOTE_ON count in a time group to include in auxiliary onset TF")
 
     # Saving
     ap.add_argument("--save-every", type=int, default=100)
@@ -540,6 +546,9 @@ if __name__ == "__main__":
         pseudo_debug_n=args.pseudo_debug_n,
         pseudo_debug_dir=args.pseudo_debug_dir,
         pseudo_debug_start_epoch=args.pseudo_debug_start_epoch,
+        timewise_onset_tf_weight=args.timewise_onset_tf_weight,
+        timewise_onset_tf_max_groups=args.timewise_onset_tf_max_groups,
+        timewise_onset_tf_min_onsets=args.timewise_onset_tf_min_onsets,
         use_augment=not args.no_augment,
         epochs=args.epochs,
         bs=args.bs,

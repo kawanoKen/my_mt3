@@ -106,6 +106,20 @@ def decode_notes_to_spans(token_ids: List[int], vocab) -> List[NoteSpan]:
 
 
 
+def _shift_spans_to_out_index(spans: List[NoteSpan], *, seq_len: int) -> List[NoteSpan]:
+    """
+    decode_notes_to_spans() indices are aligned to token_ids[(start+1):].
+    In SSL training, y_tg_p is directly `out`, so shift by +1 for indexing y_tg_p.
+    """
+    shifted: List[NoteSpan] = []
+    for ns in spans:
+        ids = [int(t) + 1 for t in ns.tok_ids if 0 <= (int(t) + 1) < int(seq_len)]
+        if not ids:
+            continue
+        shifted.append(NoteSpan(tok_ids=ids))
+    return shifted
+
+
 def build_note_confidences(note_spans: List[NoteSpan], log_prob_1d: torch.Tensor):
     """
     log_prob_1d: [S-1]  per-token log P(token) (BOSの次のステップから)
@@ -1411,12 +1425,16 @@ def train_loop_distributed_DA_confusion(
         else:
             state = ckpt_obj if not isinstance(ckpt_obj, dict) else ckpt_obj.get("model", ckpt_obj)
             model_ddp.module.load_state_dict(state, strict=False)
+            # model-only resume lacks EMA state; synchronize teacher to resumed student
+            # so pseudo-labeling can start from the same checkpoint quality.
+            ema.teacher.load_state_dict(model_ddp.module.state_dict(), strict=False)
             ckpt_name = os.path.basename(str(resume_ckpt))
             m = re.search(r"ep(\d+)\.pt$", ckpt_name)
             start_epoch = int(m.group(1)) if m else 0
             if rank == 0:
                 print(f"[resume] model-only checkpoint loaded from {resume_ckpt}")
                 print("[resume] optimizer/scheduler state not found; using fresh optimizer")
+                print("[resume] EMA teacher synced from resumed student weights")
                 if m:
                     print(f"[resume] inferred start epoch from filename: {start_epoch}")
 
@@ -1637,7 +1655,8 @@ def train_loop_distributed_DA_confusion(
                             target_idxs = torch.where(chunk_mask)[0].tolist()
 
                         for b_idx in target_idxs:
-                            spans = decode_notes_to_spans(out[b_idx].tolist(), vocab)
+                            spans_raw = decode_notes_to_spans(out[b_idx].tolist(), vocab)
+                            spans = _shift_spans_to_out_index(spans_raw, seq_len=int(y_tg_p.size(1)))
                             if len(spans) == 0:
                                 continue
                             prob_scores = build_note_confidences(spans, log_prob[b_idx])

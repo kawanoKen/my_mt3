@@ -172,6 +172,103 @@ def _token_time_frame_map(
     return out
 
 
+def _middle_window_token_mask(
+    token_ids: List[int],
+    *,
+    vocab: Vocab,
+    sr: int,
+    hop: int,
+    step_ms: int,
+    input_frames: int,
+    keep_second_half: bool,
+) -> torch.Tensor:
+    """
+    Build a boolean mask over token positions by local-time window.
+    - keep_second_half=True : keep tokens with local frame >= input_frames//2
+    - keep_second_half=False: keep tokens with local frame <  input_frames//2
+    Tokens without resolved local frame (before first TIME) are excluded.
+    """
+    frame_map = _token_time_frame_map(
+        token_ids,
+        vocab=vocab,
+        sr=int(sr),
+        hop=int(hop),
+        step_ms=int(step_ms),
+    )
+    half_fr = int(input_frames) // 2
+    keep = torch.zeros((len(token_ids),), dtype=torch.bool)
+    for i, fr in enumerate(frame_map):
+        if fr is None:
+            continue
+        if keep_second_half:
+            keep[i] = bool(int(fr) >= half_fr)
+        else:
+            keep[i] = bool(int(fr) < half_fr)
+    return keep
+
+
+def _middle_note_token_mask_batch(
+    out: torch.Tensor,
+    *,
+    vocab: Vocab,
+    sr: int,
+    hop: int,
+    step_ms: int,
+    input_frames: int,
+    pseudo_chunk_is_second: torch.Tensor,
+    ignore_second_zero_onset: bool,
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    Build token mask for chunk-confidence computation using only middle-window note-derived tokens.
+    A note is selected by NOTE_ON time in stitched 2-chunk timeline:
+      - chunk-A: keep NOTE_ON in latter half
+      - chunk-B: keep NOTE_ON in first half (and optionally exclude local 0s NOTE_ON)
+    Returned mask marks NOTE_ON/NOTE_OFF tokens of selected notes.
+    """
+    B, S = out.shape
+    mask = torch.zeros((B, S), dtype=torch.bool, device=device)
+    note_on_ids = set(vocab.note_on.values())
+    lo_fr = int(input_frames) // 2
+    hi_fr = int(input_frames) + int(input_frames) // 2
+
+    for b_idx in range(B):
+        token_ids_b = [int(t) for t in out[b_idx].tolist()]
+        spans_raw = decode_notes_to_spans(token_ids_b, vocab)
+        spans = _shift_spans_to_out_index(spans_raw, seq_len=int(S))
+        if len(spans) == 0:
+            continue
+        frame_map = _token_time_frame_map(
+            token_ids_b,
+            vocab=vocab,
+            sr=int(sr),
+            hop=int(hop),
+            step_ms=int(step_ms),
+        )
+        is_second = bool(pseudo_chunk_is_second[b_idx].item())
+        for ns in spans:
+            onset_tok_idx = None
+            for t_idx in ns.tok_ids:
+                if 0 <= int(t_idx) < len(token_ids_b) and int(token_ids_b[int(t_idx)]) in note_on_ids:
+                    onset_tok_idx = int(t_idx)
+                    break
+            if onset_tok_idx is None:
+                continue
+            onset_fr = frame_map[onset_tok_idx] if 0 <= onset_tok_idx < len(frame_map) else None
+            if onset_fr is None:
+                continue
+            onset_fr_i = int(onset_fr)
+            if is_second and bool(ignore_second_zero_onset) and onset_fr_i <= 0:
+                continue
+            onset_abs_fr = onset_fr_i + (int(input_frames) if is_second else 0)
+            if not (lo_fr <= onset_abs_fr < hi_fr):
+                continue
+            for t_idx in ns.tok_ids:
+                if 0 <= int(t_idx) < S:
+                    mask[b_idx, int(t_idx)] = True
+    return mask
+
+
 def _build_note_mask_effect_confidences(
     *,
     spans: List[NoteSpan],
@@ -555,6 +652,7 @@ def pseudo_chunk_filter(
     device: torch.device,
     pseudo_threshold: float = -0.5,
     pseudo_topn: int = 0,
+    conf_token_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Compute per-sample chunk confidence and return a boolean mask (B,).
@@ -569,6 +667,8 @@ def pseudo_chunk_filter(
     confs = torch.full((B,), -float("inf"), device=device)
     for b in range(B):
         valid = (out[b] != pad_id) & (out[b] != eos_id)
+        if conf_token_mask is not None:
+            valid = valid & conf_token_mask[b].to(device=device)
         n_valid = valid.sum().item()
         if n_valid == 0:
             continue
@@ -950,12 +1050,26 @@ def _save_pseudo_debug_sample(
 
 def make_collate_real():
     def _collate(batch):
-        # batch: List[(Tensor[T,F], int, int)]
-        mels = [b[0] for b in batch]
-        idxs = torch.tensor([b[1] for b in batch], dtype=torch.long)
-        starts = torch.tensor([b[2] for b in batch], dtype=torch.long)
-        mels_padded = nn.utils.rnn.pad_sequence(mels, batch_first=True)  # [B,T,F]
-        return mels_padded, idxs, starts
+        # default batch: List[(mel, idx, start)]
+        if len(batch[0]) == 3:
+            mels = [b[0] for b in batch]
+            idxs = torch.tensor([b[1] for b in batch], dtype=torch.long)
+            starts = torch.tensor([b[2] for b in batch], dtype=torch.long)
+            mels_padded = nn.utils.rnn.pad_sequence(mels, batch_first=True)  # [B,T,F]
+            return mels_padded, idxs, starts
+
+        # consecutive-pair batch: List[(mel_a, mel_b, idx, start_a, start_b)]
+        if len(batch[0]) == 5:
+            mels_a = [b[0] for b in batch]
+            mels_b = [b[1] for b in batch]
+            idxs = torch.tensor([b[2] for b in batch], dtype=torch.long)
+            starts_a = torch.tensor([b[3] for b in batch], dtype=torch.long)
+            starts_b = torch.tensor([b[4] for b in batch], dtype=torch.long)
+            mels_a_padded = nn.utils.rnn.pad_sequence(mels_a, batch_first=True)
+            mels_b_padded = nn.utils.rnn.pad_sequence(mels_b, batch_first=True)
+            return mels_a_padded, mels_b_padded, idxs, starts_a, starts_b
+
+        raise RuntimeError(f"Unexpected real batch tuple length: {len(batch[0])}")
     return _collate
 
 def _pm_to_note_arrays(pm) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -1136,6 +1250,8 @@ def train_loop_distributed_DA_confusion(
     pseudo_note_mask_fill: str = "zero",
     pseudo_note_without_chunk: bool = False,
     pseudo_repair_order: bool = False,
+    pseudo_double_chunk_middle_only: bool = False,
+    pseudo_ignore_second_zero_onset: bool = False,
     pseudo_debug_n: int = 0,
     pseudo_debug_dir: str | None = None,
     pseudo_debug_start_epoch: int = 0,  # deprecated: debug starts at pseudo_start_epoch
@@ -1242,7 +1358,15 @@ def train_loop_distributed_DA_confusion(
             raise ValueError("pairs_real={'train':[wav,...]} が必須です（DC/pseudoで使用）")
         real_wavs = pairs_real["train"]
         if real_wavs:
-            real_ds = AMTRealDataset(real_wavs, sr=sr, hop=256, input_frames=input_frames, n_fft=2048, n_mels=256,)
+            real_ds = AMTRealDataset(
+                real_wavs,
+                sr=sr,
+                hop=256,
+                input_frames=input_frames,
+                n_fft=2048,
+                n_mels=256,
+                consecutive_pair=bool(use_pseudo and pseudo_double_chunk_middle_only),
+            )
             real_sampler = DistributedSampler(real_ds, shuffle=True, drop_last=True)
             real_dl = DataLoader(
                 real_ds,
@@ -1300,6 +1424,10 @@ def train_loop_distributed_DA_confusion(
             )
     if rank == 0 and pseudo_repair_order:
         print("[pseudo-note] order-repair enabled: same-time pitch low->high, on->off, dedup same token")
+    if rank == 0 and pseudo_double_chunk_middle_only:
+        print("[pseudo-note] double-chunk middle-window mode enabled (keep 2nd-half of chunk-A + 1st-half of chunk-B)")
+    if rank == 0 and pseudo_ignore_second_zero_onset:
+        print("[pseudo-note] ignore onset-at-0s for chunk-B enabled")
     if rank == 0 and float(timewise_onset_tf_weight) > 0.0:
         print(
             "[timewise-tf] enabled: "
@@ -1505,11 +1633,19 @@ def train_loop_distributed_DA_confusion(
             fast_dec = FastDecoderKV(ema.teacher.dec, max_len=pseudo_max_len).to(device).eval()
 
         for batch_idx, (mels_s, y_in_s, y_tg_s) in enumerate(pbar, start=1):
-            mels_r, real_idxs, real_starts = (None, None, None)
+            mels_r, mels_r_next, real_idxs, real_starts, real_starts_next = (None, None, None, None, None)
             if real_iter is not None:
-                mels_r, real_idxs, real_starts = next(real_iter)
+                real_batch = next(real_iter)
+                if len(real_batch) == 3:
+                    mels_r, real_idxs, real_starts = real_batch
+                elif len(real_batch) == 5:
+                    mels_r, mels_r_next, real_idxs, real_starts, real_starts_next = real_batch
+                else:
+                    raise RuntimeError(f"Unexpected real batch length: {len(real_batch)}")
             if mels_r is not None:
                 mels_r = mels_r.to(device, non_blocking=True)
+            if mels_r_next is not None:
+                mels_r_next = mels_r_next.to(device, non_blocking=True)
 
             mels_s = mels_s.to(device, non_blocking=True)
             y_in_s = y_in_s.to(device, non_blocking=True)
@@ -1567,23 +1703,113 @@ def train_loop_distributed_DA_confusion(
             loss_unsup = torch.zeros((), device=device)
 
             if use_pseudo and real_dl is not None and (ep + 1) >= pseudo_start_epoch:
-                out, _pmax, _margin, log_prob = pseudo_label_with_kvcache(
-                    teacher=ema.teacher,
-                    fast_dec=fast_dec,
-                    mel=mels_r,
-                    program_id=0,
-                    vocab=vocab,
-                    max_new_tokens=pseudo_max_len,
-                    return_with_prefix=False,
-                )
-                if pseudo_repair_order:
-                    out, log_prob = canonicalize_pseudo_batch_order(
-                        out,
-                        log_prob,
+                use_double_middle = bool(pseudo_double_chunk_middle_only and (mels_r_next is not None))
+                if use_double_middle:
+                    pad_id_local = int(vocab.pad)
+                    out_a, _pmax_a, _margin_a, log_prob_a = pseudo_label_with_kvcache(
+                        teacher=ema.teacher,
+                        fast_dec=fast_dec,
+                        mel=mels_r,
+                        program_id=0,
                         vocab=vocab,
-                        pad_id=int(vocab.pad),
-                        eos_id=int(vocab.eos),
+                        max_new_tokens=pseudo_max_len,
+                        return_with_prefix=False,
                     )
+                    out_b, _pmax_b, _margin_b, log_prob_b = pseudo_label_with_kvcache(
+                        teacher=ema.teacher,
+                        fast_dec=fast_dec,
+                        mel=mels_r_next,
+                        program_id=0,
+                        vocab=vocab,
+                        max_new_tokens=pseudo_max_len,
+                        return_with_prefix=False,
+                    )
+                    if pseudo_repair_order:
+                        out_a, log_prob_a = canonicalize_pseudo_batch_order(
+                            out_a,
+                            log_prob_a,
+                            vocab=vocab,
+                            pad_id=int(vocab.pad),
+                            eos_id=int(vocab.eos),
+                        )
+                        out_b, log_prob_b = canonicalize_pseudo_batch_order(
+                            out_b,
+                            log_prob_b,
+                            vocab=vocab,
+                            pad_id=int(vocab.pad),
+                            eos_id=int(vocab.eos),
+                        )
+
+                    # out/log_prob lengths can differ between chunk-A and chunk-B.
+                    # Pad each side to a common length before batch-concatenation.
+                    if int(out_a.size(1)) != int(out_b.size(1)):
+                        out_len = max(int(out_a.size(1)), int(out_b.size(1)))
+                        if int(out_a.size(1)) < out_len:
+                            out_a_pad = torch.full(
+                                (int(out_a.size(0)), out_len - int(out_a.size(1))),
+                                fill_value=pad_id_local,
+                                dtype=out_a.dtype,
+                                device=out_a.device,
+                            )
+                            out_a = torch.cat([out_a, out_a_pad], dim=1)
+                        if int(out_b.size(1)) < out_len:
+                            out_b_pad = torch.full(
+                                (int(out_b.size(0)), out_len - int(out_b.size(1))),
+                                fill_value=pad_id_local,
+                                dtype=out_b.dtype,
+                                device=out_b.device,
+                            )
+                            out_b = torch.cat([out_b, out_b_pad], dim=1)
+
+                    if int(log_prob_a.size(1)) != int(log_prob_b.size(1)):
+                        lp_len = max(int(log_prob_a.size(1)), int(log_prob_b.size(1)))
+                        if int(log_prob_a.size(1)) < lp_len:
+                            lp_a_pad = torch.full(
+                                (int(log_prob_a.size(0)), lp_len - int(log_prob_a.size(1))),
+                                fill_value=-float("inf"),
+                                dtype=log_prob_a.dtype,
+                                device=log_prob_a.device,
+                            )
+                            log_prob_a = torch.cat([log_prob_a, lp_a_pad], dim=1)
+                        if int(log_prob_b.size(1)) < lp_len:
+                            lp_b_pad = torch.full(
+                                (int(log_prob_b.size(0)), lp_len - int(log_prob_b.size(1))),
+                                fill_value=-float("inf"),
+                                dtype=log_prob_b.dtype,
+                                device=log_prob_b.device,
+                            )
+                            log_prob_b = torch.cat([log_prob_b, lp_b_pad], dim=1)
+
+                    out = torch.cat([out_a, out_b], dim=0)
+                    log_prob = torch.cat([log_prob_a, log_prob_b], dim=0)
+                    mels_pseudo = torch.cat([mels_r, mels_r_next], dim=0)
+                    B0 = int(out_a.size(0))
+                    pseudo_chunk_is_second = torch.zeros((int(out.size(0)),), dtype=torch.bool, device=device)
+                    pseudo_chunk_is_second[B0:] = True
+                    if real_idxs is not None:
+                        real_idxs = torch.cat([real_idxs, real_idxs], dim=0)
+                    if real_starts is not None and real_starts_next is not None:
+                        real_starts = torch.cat([real_starts, real_starts_next], dim=0)
+                else:
+                    out, _pmax, _margin, log_prob = pseudo_label_with_kvcache(
+                        teacher=ema.teacher,
+                        fast_dec=fast_dec,
+                        mel=mels_r,
+                        program_id=0,
+                        vocab=vocab,
+                        max_new_tokens=pseudo_max_len,
+                        return_with_prefix=False,
+                    )
+                    if pseudo_repair_order:
+                        out, log_prob = canonicalize_pseudo_batch_order(
+                            out,
+                            log_prob,
+                            vocab=vocab,
+                            pad_id=int(vocab.pad),
+                            eos_id=int(vocab.eos),
+                        )
+                    mels_pseudo = mels_r
+                    pseudo_chunk_is_second = torch.zeros((int(out.size(0)),), dtype=torch.bool, device=device)
 
                 B = out.size(0)
                 prg_id = int(vocab.instrument_type["PRG_0"])
@@ -1593,6 +1819,19 @@ def train_loop_distributed_DA_confusion(
 
                 pad_id = int(vocab.pad)
                 eos_id = int(vocab.eos)
+                conf_token_mask = None
+                if use_double_middle:
+                    conf_token_mask = _middle_note_token_mask_batch(
+                        out,
+                        vocab=vocab,
+                        sr=int(sr),
+                        hop=256,
+                        step_ms=int(_step_ms_note_metric),
+                        input_frames=int(input_frames),
+                        pseudo_chunk_is_second=pseudo_chunk_is_second,
+                        ignore_second_zero_onset=bool(pseudo_ignore_second_zero_onset),
+                        device=device,
+                    )
 
                 if oracle_filter and oracle_midi_cache and real_idxs is not None:
                     chunk_mask = oracle_chunk_filter(
@@ -1611,7 +1850,27 @@ def train_loop_distributed_DA_confusion(
                         pad_id=pad_id, eos_id=eos_id, device=device,
                         pseudo_threshold=pseudo_threshold,
                         pseudo_topn=pseudo_topn,
+                        conf_token_mask=conf_token_mask,
                     )
+
+                time_window_mask = torch.ones_like(y_tg_p, dtype=torch.bool)
+                if use_double_middle:
+                    time_window_mask = torch.zeros_like(y_tg_p, dtype=torch.bool)
+                    for b_idx in range(int(y_tg_p.size(0))):
+                        token_ids_b = [int(t) for t in out[b_idx].tolist()]
+                        keep_second_half = bool(not pseudo_chunk_is_second[b_idx].item())
+                        keep_mask_b = _middle_window_token_mask(
+                            token_ids_b,
+                            vocab=vocab,
+                            sr=int(sr),
+                            hop=256,
+                            step_ms=int(_step_ms_note_metric),
+                            input_frames=int(input_frames),
+                            keep_second_half=keep_second_half,
+                        ).to(device=device)
+                        L = min(int(y_tg_p.size(1)), int(keep_mask_b.numel()))
+                        if L > 0:
+                            time_window_mask[b_idx, :L] = keep_mask_b[:L]
 
                 use_token_only_without_chunk = bool(pseudo_note_target_only and pseudo_note_without_chunk)
                 use_oracle_token_only_without_chunk = bool(
@@ -1638,6 +1897,7 @@ def train_loop_distributed_DA_confusion(
                             final_mask = note_mask
                         else:
                             final_mask = note_mask & chunk_mask.unsqueeze(1)
+                        final_mask = final_mask & time_window_mask
                         y_tg_masked = torch.full_like(y_tg_p, pad_id)
                         y_tg_masked[final_mask] = y_tg_p[final_mask]
                         note_on_ids = set(vocab.note_on.values())
@@ -1659,6 +1919,43 @@ def train_loop_distributed_DA_confusion(
                             spans = _shift_spans_to_out_index(spans_raw, seq_len=int(y_tg_p.size(1)))
                             if len(spans) == 0:
                                 continue
+                            token_ids_b = [int(t) for t in out[b_idx].tolist()]
+                            frame_map = _token_time_frame_map(
+                                token_ids_b,
+                                vocab=vocab,
+                                sr=int(sr),
+                                hop=256,
+                                step_ms=int(_step_ms_note_metric),
+                            )
+                            note_on_ids = set(vocab.note_on.values())
+
+                            # Note-event-level middle-window selection (MIDI-equivalent behavior):
+                            # keep notes by NOTE_ON time in the stitched 2-chunk timeline.
+                            if use_double_middle:
+                                lo_fr = int(input_frames) // 2
+                                hi_fr = int(input_frames) + int(input_frames) // 2
+                                spans_mid: List[NoteSpan] = []
+                                for ns in spans:
+                                    onset_tok_idx = None
+                                    for t_idx in ns.tok_ids:
+                                        if 0 <= int(t_idx) < len(token_ids_b) and int(token_ids_b[int(t_idx)]) in note_on_ids:
+                                            onset_tok_idx = int(t_idx)
+                                            break
+                                    if onset_tok_idx is None:
+                                        continue
+                                    onset_fr = frame_map[onset_tok_idx] if 0 <= onset_tok_idx < len(frame_map) else None
+                                    if onset_fr is None:
+                                        continue
+                                    onset_fr_i = int(onset_fr)
+                                    if bool(pseudo_chunk_is_second[b_idx].item()) and bool(pseudo_ignore_second_zero_onset):
+                                        if onset_fr_i <= 0:
+                                            continue
+                                    onset_abs_fr = onset_fr_i + (int(input_frames) if bool(pseudo_chunk_is_second[b_idx].item()) else 0)
+                                    if lo_fr <= onset_abs_fr < hi_fr:
+                                        spans_mid.append(ns)
+                                spans = spans_mid
+                                if len(spans) == 0:
+                                    continue
                             prob_scores = build_note_confidences(spans, log_prob[b_idx])
 
                             need_mask_scores = (
@@ -1667,24 +1964,15 @@ def train_loop_distributed_DA_confusion(
                             )
                             mask_scores = None
                             if need_mask_scores:
-                                token_ids_b = [int(t) for t in out[b_idx].tolist()]
                                 y_in_b = y_in_p[b_idx].unsqueeze(0)
                                 y_tg_b = y_tg_p[b_idx].unsqueeze(0)
                                 with torch.no_grad():
                                     base_tf_logp = _teacher_forced_token_logp(
                                         model=ema.teacher,
-                                        mel_1=mels_r[b_idx:b_idx + 1],
+                                        mel_1=mels_pseudo[b_idx:b_idx + 1],
                                         y_in_1=y_in_b,
                                         y_tg_1=y_tg_b,
                                     )
-                                frame_map = _token_time_frame_map(
-                                    token_ids_b,
-                                    vocab=vocab,
-                                    sr=int(sr),
-                                    hop=256,
-                                    step_ms=int(_step_ms_note_metric),
-                                )
-                                note_on_ids = set(vocab.note_on.values())
                                 onset_pos = []
                                 for ns in spans:
                                     found = None
@@ -1703,7 +1991,7 @@ def train_loop_distributed_DA_confusion(
                                 masked_by_frame: Dict[int, torch.Tensor] = {}
                                 for fr in needed_frames:
                                     mel_mask = apply_source_mask_band(
-                                        mels_r[b_idx:b_idx + 1],
+                                        mels_pseudo[b_idx:b_idx + 1],
                                         center_frame=int(fr),
                                         width_ratio=float(pseudo_note_mask_width_ratio),
                                         fill=_mask_fill,
@@ -1772,6 +2060,7 @@ def train_loop_distributed_DA_confusion(
                     else:
                         y_tg_masked = y_tg_p.clone()
                         y_tg_masked[~chunk_mask] = pad_id
+                        y_tg_masked[~time_window_mask] = pad_id
                         kept_idxs = torch.where(chunk_mask)[0].tolist()
                         for b_idx in kept_idxs:
                             running_pseudo_notes += len(decode_notes_to_spans(out[b_idx].tolist(), vocab))
@@ -1872,10 +2161,13 @@ def train_loop_distributed_DA_confusion(
                     # teacher: clean mel (used in pseudo_label_with_kvcache above)
                     # student: augmented mel for consistency regularization
                     if aug_cfg is not None:
-                        mels_r_aug = augment_spectrogram(mels_r, aug_cfg)
+                        mels_r_aug = augment_spectrogram(mels_pseudo, aug_cfg)
                         mem_r_student = model_ddp.module.enc(mels_r_aug)
                     else:
-                        mem_r_student = mem_r
+                        if use_double_middle:
+                            mem_r_student = model_ddp.module.enc(mels_pseudo)
+                        else:
+                            mem_r_student = mem_r
 
                     if (y_tg_masked != pad_id).any():
                         logits_r = model_ddp.module.dec(y_in_p.to(device), mem_r_student)

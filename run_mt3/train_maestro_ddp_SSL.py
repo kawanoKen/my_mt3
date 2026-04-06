@@ -369,6 +369,11 @@ if __name__ == "__main__":
                      help="when pseudo_note_target_only is enabled, ignore chunk filter and use token-only mask")
     ap.add_argument("--pseudo_repair_order", action="store_true",
                      help="repair pseudo token order before chunk filter: same-time pitch low->high, on->off, dedup same token")
+    ap.add_argument("--pseudo_double_chunk_middle_only", action="store_true",
+                     help="for pseudo labels, decode two consecutive real chunks and keep only middle window "
+                          "(2nd half of chunk-A + 1st half of chunk-B)")
+    ap.add_argument("--pseudo_ignore_second_zero_onset", action="store_true",
+                     help="when pseudo_double_chunk_middle_only is enabled, ignore NOTE_ON at local 0s in chunk-B")
     ap.add_argument("--pseudo_debug_n", type=int, default=0,
                      help="save N pseudo-label debug samples (txt + piano roll) for kept chunks")
     ap.add_argument("--pseudo_debug_dir", type=str, default=None,
@@ -598,6 +603,8 @@ if __name__ == "__main__":
         pseudo_note_mask_fill=args.pseudo_note_mask_fill,
         pseudo_note_without_chunk=args.pseudo_note_without_chunk,
         pseudo_repair_order=args.pseudo_repair_order,
+        pseudo_double_chunk_middle_only=args.pseudo_double_chunk_middle_only,
+        pseudo_ignore_second_zero_onset=args.pseudo_ignore_second_zero_onset,
         pseudo_debug_n=args.pseudo_debug_n,
         pseudo_debug_dir=args.pseudo_debug_dir,
         pseudo_debug_start_epoch=args.pseudo_debug_start_epoch,

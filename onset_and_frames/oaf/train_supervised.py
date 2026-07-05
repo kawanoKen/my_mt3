@@ -88,14 +88,13 @@ def main():
 
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", type=str, default="cuda")
-    ap.add_argument("--iters", type=int, default=50_000)
+    ap.add_argument("--iters", type=int, default=20_000)
     ap.add_argument("--batch_size", type=int, default=8)
     ap.add_argument("--segment_seconds", type=float, default=20.0)
     ap.add_argument("--num_workers", type=int, default=None,
                      help="override dataloader workers (default: TrainConfig.num_workers)")
 
     ap.add_argument("--use_weighted_frame_loss", action="store_true")
-    ap.add_argument("--use_offset_head", action="store_true")
     ap.add_argument("--use_velocity_head", action="store_true")
 
     ap.add_argument("--resume", type=str, default=None)
@@ -106,7 +105,7 @@ def main():
                      help="save numbered checkpoint (step_N.pt) every N steps (0=off)")
     ap.add_argument("--keep_last_n", type=int, default=0,
                      help="keep only last N numbered checkpoints (0=keep all)")
-    ap.add_argument("--valid_every", type=int, default=2000,
+    ap.add_argument("--valid_every", type=int, default=1000,
                      help="run validation every N steps")
     ap.add_argument("--log_every", type=int, default=50,
                      help="update progress bar every N steps")
@@ -142,7 +141,6 @@ def main():
     model_cfg = ModelConfig(
         n_mels=feat_cfg.n_mels,
         n_pitches=lab_cfg.midi_max - lab_cfg.midi_min + 1,
-        use_offset_head=args.use_offset_head,
         use_velocity_head=args.use_velocity_head,
     )
     train_cfg = TrainConfig(
@@ -150,6 +148,7 @@ def main():
         segment_seconds=args.segment_seconds,
         device=str(device),
     )
+    train_cfg.amp = False
     if args.num_workers is not None:
         train_cfg.num_workers = int(args.num_workers)
 
@@ -262,7 +261,7 @@ def main():
         use_weighted_frame_loss=args.use_weighted_frame_loss,
         lambda_on=1.0,
         lambda_fr=1.0,
-        lambda_off=1.0 if args.use_offset_head else 0.0,
+        lambda_off=1.0,
         lambda_vel=1.0 if args.use_velocity_head else 0.0,
     )
 
@@ -319,7 +318,7 @@ def main():
             if rank == 0:
                 history.append(step + 1, train_loss=l_val)
                 history.save(history_json_path)
-                history.plot(history_png_path, title="Supervised Training Loss")
+                history.plot(history_png_path, title="Supervised train / val loss")
 
         if rank == 0 and (step + 1) % args.ckpt_every == 0:
             save_checkpoint(out_dir / "checkpoints" / "last.pt", raw_model, opt, sch, step=step + 1)
@@ -359,7 +358,7 @@ def main():
                     best_val = val
                     save_checkpoint(out_dir / "checkpoints" / "best.pt", raw_model, opt, sch, step=step + 1, extra={"val_loss": val})
                 history.save(history_json_path)
-                history.plot(history_png_path, title="Supervised Training Loss")
+                history.plot(history_png_path, title="Supervised train / val loss")
             model.train()
 
     # Always record final validation once, even if it does not hit valid_every.
@@ -393,13 +392,13 @@ def main():
                 best_val = val
                 save_checkpoint(out_dir / "checkpoints" / "best.pt", raw_model, opt, sch, step=args.iters, extra={"val_loss": val})
             history.save(history_json_path)
-            history.plot(history_png_path, title="Supervised Training Loss")
+            history.plot(history_png_path, title="Supervised train / val loss")
         model.train()
 
     if rank == 0:
         save_checkpoint(out_dir / "checkpoints" / "last.pt", raw_model, opt, sch, step=args.iters)
         history.save(history_json_path)
-        history.plot(history_png_path, title="Supervised Training Loss")
+        history.plot(history_png_path, title="Supervised train / val loss")
         print("Done.")
 
     if ddp:

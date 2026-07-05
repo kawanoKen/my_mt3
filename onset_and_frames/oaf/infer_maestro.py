@@ -88,8 +88,10 @@ def main() -> None:
     state = ckpt_obj["model"] if isinstance(ckpt_obj, dict) and "model" in ckpt_obj else ckpt_obj
     if any(k.startswith("module.") for k in state.keys()):
         state = {k[len("module."):]: v for k, v in state.items()}
-    has_offset_head = any(k.startswith("offset_") for k in state.keys())
-    has_velocity_head = any(k.startswith("velocity_") for k in state.keys())
+    # has_offset_head = any(k.startswith("offset_") for k in state.keys())
+    # has_velocity_head = any(k.startswith("velocity_") for k in state.keys())
+    has_offset_head = any(k.startswith("offset_stack") or k.startswith("offset_") for k in state.keys())
+    has_velocity_head = any(k.startswith("velocity_stack") or k.startswith("velocity_") for k in state.keys())
 
     use_offset_head = _resolve_head_flag(args.model_use_offset_head, has_offset_head)
     use_velocity_head = _resolve_head_flag(args.model_use_velocity_head, has_velocity_head)

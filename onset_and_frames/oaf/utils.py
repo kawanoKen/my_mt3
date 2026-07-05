@@ -98,14 +98,21 @@ class LossHistory:
         except ImportError:
             return
 
-        keys = [k for k in self.records[0] if k != "step"]
-        steps = [r["step"] for r in self.records]
+        # Union keys across records so sparse series (e.g. val_loss) are not dropped
+        # when the first row only has train_loss.
+        keys = sorted({k for r in self.records for k in r if k != "step"})
 
         fig, ax = plt.subplots(figsize=(10, 5))
         for k in keys:
-            vals = [r.get(k) for r in self.records]
-            if vals[0] is not None:
-                ax.plot(steps, vals, label=k, alpha=0.8)
+            xs: list[int] = []
+            ys: list[float] = []
+            for r in self.records:
+                v = r.get(k)
+                if v is not None:
+                    xs.append(int(r["step"]))
+                    ys.append(float(v))
+            if xs:
+                ax.plot(xs, ys, label=k, alpha=0.8)
         ax.set_xlabel("step")
         ax.set_ylabel("loss")
         ax.set_title(title)

@@ -42,6 +42,7 @@ class ModelConfig:
     use_velocity_head: bool = False
     # projection dim after conv flattening (per frame)
     proj_dim: int = 512
+    model_complexity: int = 48
 
 
 @dataclass
@@ -50,15 +51,15 @@ class TrainConfig:
     batch_size_unlabeled: int = 8
 
     # segmenting (training uses fixed-length crops)
-    segment_seconds: float = 20.0
+    segment_seconds: float = 20.48
     # if True, try to avoid starting a segment in the middle of a note for labeled data
     avoid_note_splits: bool = False
 
     # optimizer / schedule
-    lr: float = 6e-5  # SSL paper default
+    lr: float = 2e-5  # SSL paper default
     lr_decay_gamma: float = 0.98
     lr_decay_every_steps: int = 5000
-    grad_clip_norm: float = 3.0
+    grad_clip_norm: float = 1.0
 
     # iterations
     iters_supervised: int = 50_000
